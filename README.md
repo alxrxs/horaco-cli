@@ -10,7 +10,7 @@ familiar commands — abbreviation, `?` help, and Tab completion included — in
 clicking radio buttons.
 
 ```
-switch# show interfaces status
+switch# show interfaces
 Interface  Cap   Link      Speed   Admin   PVID  Mode      Description     VLANs (u=untag,t=tag)
 Tw1        2.5G  Link Up   2500M   Enable  10    ex-trunk  AP uplink       11t,42t,43t
 Tw2        2.5G  Link Up   1000M   Enable  42    access    -               42u
@@ -69,7 +69,7 @@ work: `interface range tw1-4`, `interface te1,te2`.
 
 ```
 show vlan                         # VLAN table: name, untagged/tagged ports
-show interfaces status            # link, negotiated speed, admin, PVID, mode, membership
+show interfaces                   # link, negotiated speed, admin, PVID, mode, membership
 show running-config               # reconstructed IOS-style config
 show version                      # model / firmware / MAC / IP
 
@@ -200,7 +200,7 @@ erase startup-config  /  factory-reset       # restore factory defaults (confirm
 
 The ZX-SWTG124AS firmware has **no port-name/description field** on the device, so
 `description ...` is stored locally in a `descriptions.yml` sidecar (next to your
-inventory), keyed by switch name → port. It shows in `show interfaces status` /
+inventory), keyed by switch name → port. It shows in `show interfaces` /
 `show running-config` but is never written to the switch. Port capability (2.5G vs 10G)
 is fixed by hardware and shown in the `Cap` column.
 

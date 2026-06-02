@@ -844,9 +844,7 @@ CFG = ("config", "vlan", "iface")  # config-level cmds also re-dispatch from sub
 HELP = {
     "show": "Display switch information",
     "vlan": "VLAN table ('show') / create-enter a VLAN (config)",
-    "brief": "Condensed output",
     "interfaces": "Per-port status",
-    "status": "Per-port status",
     "running-config": "Current running configuration",
     "version": "Model / firmware / addresses",
     "enable": "Enter privileged mode (already privileged)",
@@ -958,8 +956,6 @@ class CLI:
         return [
             # show — available in every mode
             (ALL, [_lit("show"), _lit("vlan")], lambda a: self.show_vlan(), "VLAN table"),
-            (ALL, [_lit("show"), _lit("vlan"), _lit("brief")], lambda a: self.show_vlan(True), "VLAN table (brief)"),
-            (ALL, [_lit("show"), _lit("interfaces"), _lit("status")], lambda a: self.show_interfaces(), "port status"),
             (ALL, [_lit("show"), _lit("interfaces")], lambda a: self.show_interfaces(), "port status"),
             (ALL, [_lit("show"), _lit("running-config")], lambda a: self.show_running(), "running config"),
             (ALL, [_lit("show"), _lit("version")], lambda a: self.show_version(), "system info"),
@@ -1111,7 +1107,7 @@ class CLI:
         ]
 
     # ---- show commands ---------------------------------------------------- #
-    def show_vlan(self, brief=False):
+    def show_vlan(self):
         vlans = self.sw.fetch_vlans()
         print(f"{'VLAN':<6}{'Name':<20}{'Untagged':<14}{'Tagged':<14}")
         print("-" * 54)
