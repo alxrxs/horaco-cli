@@ -161,26 +161,26 @@ def fmt_portlist(ports):
 ACCEPT_NAMES = {0: "all", 1: "tag-only", 2: "untag-only"}
 ACCEPT_CODES = {"all": 0, "tag-only": 1, "untag-only": 2, "tag": 1, "untag": 2}
 
-# Speed/duplex select codes (port.cgi). 2.5G ports accept 0-6; 10G ports 0,4,5,6,8.
+# port.cgi speed_duplex select codes. The text form (cfg_speed) like '2500M/Full' is
+# normalised to one of these keys; 2.5G ports accept 0-6, 10G ports accept 0,4,5,6,8.
 SPEED_CODES = {
     "auto": 0, "10half": 1, "10full": 2, "100half": 3, "100full": 4,
     "1000": 5, "1000full": 5, "2500": 6, "2500full": 6, "10g": 8, "10gfull": 8,
 }
-# IOS-flavoured 'speed' keyword -> (code) ; duplex handled separately for 10/100.
 JUMBO_CODES = {"1522": 0, "1536": 1, "1552": 2, "9216": 3, "16383": 4}
-STORM_CODES = {  # IOS-ish storm-control keyword -> switch storm_filter value
+STORM_CODES = {  # storm-control keyword -> switch storm_filter value
     "unknown-unicast": 0, "unknown-multicast": 1, "multicast": 2, "broadcast": 3,
 }
 MIRROR_DIR = {"rx": 1, "tx": 2, "both": 3}
-# STP port priority must be a multiple of 16 (0..240); global priority multiple of 4096.
 
-# Physical port capability for the ZX-SWTG124AS: ports 1-4 are 2.5G, 5-6 are 10G(SFP+).
+
 def desc_file():
     """Sidecar path for port descriptions — lives beside the inventory, not in the tool."""
     return os.path.join(data_dir(), "descriptions.yml")
 
 
 def port_capability(port):
+    """ZX-SWTG124AS layout: ports 1-4 are 2.5G copper, ports 5-6 are 10G SFP+."""
     return "10G" if port >= 5 else "2.5G"
 
 
@@ -875,13 +875,11 @@ HELP = {
     "shutdown": "Administratively disable the port",
     "switchport": "Configure Layer-2 switching",
     "access": "Access-port settings",
-    "mode": "Set the port mode (access/trunk/exclusive-trunk)",
-    "trunk": "Trunk: tagged members of all VLANs, accept all frames",
+    "mode": "Select a mode / variant",
+    "trunk": "Trunk-port settings",
     "exclusive-trunk": "Trunk accepting tagged frames only (native retained but ignored)",
     "native": "Trunk native (untagged) VLAN",
     "allowed": "VLANs carried on the trunk",
-    "add": "Add to the current set",
-    "remove": "Remove from the current set",
     # system / ip / user
     "ip": "IP / management / IGMP settings",
     "address": "Set management IP address",
@@ -896,11 +894,9 @@ HELP = {
     "speed": "Set port speed (auto/10/100/1000/2500/10g)",
     "duplex": "Set port duplex (auto/half/full)",
     "flowcontrol": "Set 802.3x flow control (on/off)",
-    "priority": "QoS port-default priority (queue) 1-8",
+    "priority": "Set a priority value",
     "storm-control": "Per-port storm control",
     "rate-limit": "Per-port ingress/egress bandwidth limit",
-    "ingress": "Ingress (received) direction",
-    "egress": "Egress (transmitted) direction",
     "isolation": "Port isolation (block forwarding to listed ports)",
     "channel-group": "Add this port to a port-channel (EtherChannel)",
     "spanning-tree": "STP/RSTP settings",
@@ -908,27 +904,18 @@ HELP = {
     "port-priority": "STP port priority (0-240, step 16)",
     "link-type": "STP point-to-point link type",
     "portfast": "STP edge port (portfast)",
-    "loop-protection": "Loop-protection mechanism (port: apply it here)",
-    "loop-detection": "Detect loops and report (no blocking)",
-    "loop-prevention": "Detect loops and block the offending port",
+    "loop-protection": "Loop protection (global mechanism / per-port apply)",
     "port-security": "Per-port learned-MAC count limit",
     "maximum": "Maximum number of MAC addresses",
-    "broadcast": "Broadcast storm",
-    "unknown-unicast": "Unknown (flooded) unicast storm",
-    "unknown-multicast": "Unknown multicast storm",
-    "multicast": "Known multicast storm",
     # qos / scheduler
     "qos": "Quality of Service",
     "wrr": "Weighted round-robin queue weight",
-    "queue": "Egress queue (1-8)",
-    "weight": "WRR weight (1-15) or 'strict'",
     "scheduler": "Queue scheduling (WRR weights / strict)",
     # global features
     "jumbo-frame": "Maximum frame size in bytes",
     "system": "Firmware management (boot system)",
     "igmp": "IGMP snooping",
     "snooping": "Enable snooping",
-    "mode": "Set mode / variant",
     "energy-efficient-ethernet": "802.3az Energy Efficient Ethernet",
     "eee": "802.3az Energy Efficient Ethernet",
     "monitor": "Port mirroring (SPAN) session",
@@ -940,13 +927,10 @@ HELP = {
     "summary": "One-line summary",
     # tools
     "backup": "Save the running config to a local file",
-    "restore": "Load (restore) a config file (disruptive)",
     "boot": "Firmware management",
     "reload": "Reboot the switch (disruptive)",
     "erase": "Erase configuration",
     "factory-reset": "Restore factory defaults (disruptive)",
-    "config": "Configuration file",
-    "table": "Table output",
     # Note: keyword-CHOICE descriptions (on/off/auto/stp/rx/...) are NOT here — they
     # live inline in each _kw(...) in the grammar tree so the same word can mean
     # different things in different commands. Only literals/keyword-NAMES live here.
@@ -959,10 +943,10 @@ ARG_HELP = {
     "gw": "<A.B.C.D>  gateway", "user": "<name>", "pass": "<password>",
     "n": "<integer>", "rate": "<kbps>", "mac": "<HH:HH:HH:HH:HH:HH>",
     "id": "<group-id 1-2>", "cost": "<0-200000000, 0=auto>",
-    "prio": "<priority>", "size": "<bytes>", "file": "<path>",
+    "prio": "<priority>", "file": "<path>",
     "weight": "<1-15>  WRR weight", "queue": "<1-8>  egress queue",
-    "addr": "<A.B.C.D>", "if": "<interface>", "src": "<interface>",
-    "dst": "<interface>", "ports": "<interface-range>", "peers": "<interface-range>",
+    "if": "<interface>", "src": "<interface>", "dst": "<interface>",
+    "ports": "<interface-range>", "peers": "<interface-range>",
 }
 
 
@@ -1101,7 +1085,7 @@ class CLI:
                 ("on", "Enable 802.3x flow control"),
                 ("off", "Disable flow control"))], self._h_flow, "flow control"),
             (("iface",), [_lit("qos"), _lit("priority"), _int("prio")], self._h_qos_priority, "default priority queue"),
-            (("iface",), [_lit("rate-limit"), _kw("dir", *_RL_DIR, ), _int("rate")], self._h_rate_limit, "bandwidth limit (kbps)"),
+            (("iface",), [_lit("rate-limit"), _kw("dir", *_RL_DIR), _int("rate")], self._h_rate_limit, "bandwidth limit (kbps)"),
             (("iface",), [_lit("no"), _lit("rate-limit"), _kw("dir", *_RL_DIR)], self._h_no_rate_limit, "remove bandwidth limit"),
             (("iface",), [_lit("storm-control"), _kw("kind", *_STORM_KIND), _lit("level"), _int("rate")], self._h_storm_on, "enable storm control"),
             (("iface",), [_lit("no"), _lit("storm-control"), _kw("kind", *_STORM_KIND)], self._h_storm_off, "disable storm control"),
