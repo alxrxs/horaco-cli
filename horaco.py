@@ -803,7 +803,20 @@ def _lit(w):
 
 
 def _kw(name, *choices):
-    return ("kw", name, tuple(choices))
+    """A choice keyword. Each choice is either a bare string or a (choice, help) pair.
+
+    Per-choice help lives HERE, in the grammar tree — so the same word ('on', 'auto',
+    'static') can carry a different '?' description in each command, instead of a single
+    global meaning. spec[2] = tuple of choice strings; spec[3] = {choice: help}.
+    """
+    names, help_map = [], {}
+    for c in choices:
+        if isinstance(c, tuple):
+            names.append(c[0])
+            help_map[c[0]] = c[1]
+        else:
+            names.append(c)
+    return ("kw", name, tuple(names), help_map)
 
 
 def _int(name):
@@ -821,6 +834,15 @@ def _arg(name):
 
 def _iface(name="range"):
     return ("iface", name)
+
+
+# Reused (choice, help) sets — defined once so both the set and 'no' rows stay in sync.
+_RL_DIR = (("ingress", "Limit received (ingress) traffic"),
+           ("egress", "Limit transmitted (egress) traffic"))
+_STORM_KIND = (("broadcast", "Broadcast frames"),
+               ("multicast", "Known multicast frames"),
+               ("unknown-unicast", "Unknown (flooded) unicast frames"),
+               ("unknown-multicast", "Unknown multicast frames"))
 
 
 ALL = ("exec", "config", "vlan", "iface")
@@ -880,13 +902,15 @@ HELP = {
     "ingress": "Ingress (received) direction",
     "egress": "Egress (transmitted) direction",
     "isolation": "Port isolation (block forwarding to listed ports)",
-    "channel-group": "Add port to a link-aggregation trunk group",
+    "channel-group": "Add this port to a port-channel (EtherChannel)",
     "spanning-tree": "STP/RSTP settings",
     "cost": "STP path cost (0 = auto)",
     "port-priority": "STP port priority (0-240, step 16)",
     "link-type": "STP point-to-point link type",
     "portfast": "STP edge port (portfast)",
-    "loop-protect": "Per-port loop protection enable",
+    "loop-protection": "Loop-protection mechanism (port: apply it here)",
+    "loop-detection": "Detect loops and report (no blocking)",
+    "loop-prevention": "Detect loops and block the offending port",
     "port-security": "Per-port learned-MAC count limit",
     "maximum": "Maximum number of MAC addresses",
     "broadcast": "Broadcast storm",
@@ -900,11 +924,10 @@ HELP = {
     "weight": "WRR weight (1-15) or 'strict'",
     "scheduler": "Queue scheduling (WRR weights / strict)",
     # global features
-    "jumbo-frame": "Maximum frame size (jumbo)",
+    "jumbo-frame": "Maximum frame size in bytes",
+    "system": "Firmware management (boot system)",
     "igmp": "IGMP snooping",
     "snooping": "Enable snooping",
-    "loop-protect-global": "Global loop protocol mode",
-    "loopback-detection": "Global loop detection/prevention mode",
     "mode": "Set mode / variant",
     "energy-efficient-ethernet": "802.3az Energy Efficient Ethernet",
     "eee": "802.3az Energy Efficient Ethernet",
@@ -912,47 +935,23 @@ HELP = {
     "session": "Mirroring session",
     "source": "Mirror source port",
     "destination": "Mirror destination port",
-    "trunk": "Trunk / link-aggregation",
+    "port-channel": "Link-aggregation group (EtherChannel)",
+    "etherchannel": "EtherChannel / link-aggregation status",
+    "summary": "One-line summary",
     # tools
-    "backup": "Download (back up) the running config blob",
-    "restore": "Upload (restore) a config blob (disruptive)",
+    "backup": "Save the running config to a local file",
+    "restore": "Load (restore) a config file (disruptive)",
     "boot": "Firmware management",
-    "system": "Firmware upgrade (enters bootloader; disruptive)",
     "reload": "Reboot the switch (disruptive)",
     "erase": "Erase configuration",
     "factory-reset": "Restore factory defaults (disruptive)",
     "config": "Configuration file",
     "table": "Table output",
-    # enumerated keyword-choice values shown by '?'
-    "stp": "802.1D Spanning Tree Protocol",
-    "rstp": "802.1w Rapid Spanning Tree Protocol",
-    "lacp": "Dynamic LACP aggregation",
-    "rx": "Mirror received (ingress) traffic",
-    "tx": "Mirror transmitted (egress) traffic",
-    "both": "Mirror both directions",
-    "auto": "Auto-negotiate",
-    "half": "Half duplex",
-    "full": "Full duplex",
-    "on": "Enable",
-    "off": "Disable",
-    "10": "10 Mbit/s",
-    "100": "100 Mbit/s",
-    "1000": "1 Gbit/s",
-    "2500": "2.5 Gbit/s",
-    "10g": "10 Gbit/s",
-    "point-to-point": "Point-to-point link",
-    "shared": "Shared (half-duplex) link",
-    "detection": "Loop detection (report only)",
-    "prevention": "Loop prevention (block port)",
+    # Note: keyword-CHOICE descriptions (on/off/auto/stp/rx/...) are NOT here — they
+    # live inline in each _kw(...) in the grammar tree so the same word can mean
+    # different things in different commands. Only literals/keyword-NAMES live here.
     "level": "Storm threshold rate",
     "strict": "Strict-priority scheduling",
-    "ingress": "Received (ingress) direction",
-    "egress": "Transmitted (egress) direction",
-    "1522": "1522 bytes (standard)",
-    "1536": "1536 bytes",
-    "1552": "1552 bytes",
-    "9216": "9216 bytes",
-    "16383": "16383 bytes (max)",
 }
 ARG_HELP = {
     "vid": "<1-4094>  VLAN ID", "list": "<vlan-list>  e.g. 10,12,777",
@@ -1012,10 +1011,13 @@ class CLI:
             (("iface",), [_lit("shutdown")], self._h_shutdown, "disable port"),
             (("iface",), [_lit("no"), _lit("shutdown")], self._h_no_shutdown, "enable port"),
             (("iface",), [_lit("switchport"), _lit("access"), _lit("vlan"), _int("vid")], self._h_access, "access VLAN"),
-            (("iface",), [_lit("switchport"), _lit("mode"), _kw("mode", "access", "trunk", "exclusive-trunk")], self._h_mode, "port mode"),
+            (("iface",), [_lit("switchport"), _lit("mode"), _kw("mode",
+                ("access", "Single untagged VLAN"),
+                ("trunk", "Tag all VLANs, accept all frames"),
+                ("exclusive-trunk", "Tag all VLANs, accept tagged only"))], self._h_mode, "port mode"),
             (("iface",), [_lit("switchport"), _lit("trunk"), _lit("native"), _lit("vlan"), _int("vid")], self._h_native, "trunk native VLAN"),
             (("iface",), [_lit("no"), _lit("switchport"), _lit("trunk"), _lit("native"), _lit("vlan")], self._h_no_native, "reset native to VLAN 1"),
-            (("iface",), [_lit("switchport"), _lit("trunk"), _lit("allowed"), _lit("vlan"), _kw("op", "add", "remove"), _rest("list", "<vlan-list>")], self._h_allowed, "edit trunk VLANs"),
+            (("iface",), [_lit("switchport"), _lit("trunk"), _lit("allowed"), _lit("vlan"), _kw("op", ("add", "Add VLANs to the tagged set"), ("remove", "Remove VLANs from the tagged set")), _rest("list", "<vlan-list>")], self._h_allowed, "edit trunk VLANs"),
             (("iface",), [_lit("switchport"), _lit("trunk"), _lit("allowed"), _lit("vlan"), _rest("list", "<vlan-list>")], self._h_allowed, "set trunk VLANs"),
 
             # ---- new SHOW commands (all modes) ---------------------------- #
@@ -1026,7 +1028,8 @@ class CLI:
             (ALL, [_lit("show"), _lit("qos")], lambda a: self.show_qos(), "QoS settings"),
             (ALL, [_lit("show"), _lit("storm-control")], lambda a: self.show_storm(), "storm control"),
             (ALL, [_lit("show"), _lit("ip"), _lit("igmp"), _lit("snooping")], lambda a: self.show_igmp(), "IGMP snooping"),
-            (ALL, [_lit("show"), _lit("trunk")], lambda a: self.show_trunk(), "link aggregation"),
+            (ALL, [_lit("show"), _lit("etherchannel"), _lit("summary")], lambda a: self.show_trunk(), "port-channel summary"),
+            (ALL, [_lit("show"), _lit("etherchannel")], lambda a: self.show_trunk(), "port-channel summary"),
             (ALL, [_lit("show"), _lit("monitor")], lambda a: self.show_mirror(), "port mirroring"),
             (ALL, [_lit("show"), _lit("isolation")], lambda a: self.show_isolation(), "port isolation"),
             (ALL, [_lit("show"), _lit("jumbo-frame")], lambda a: self.show_jumbo(), "jumbo frame size"),
@@ -1040,30 +1043,44 @@ class CLI:
             (CFG, [_lit("username"), _arg("user"), _lit("password"), _arg("pass")], self._h_username, "set admin user/pass (disruptive)"),
 
             # ---- Global feature toggles ----------------------------------- #
-            (CFG, [_lit("jumbo-frame"), _kw("size", "1522", "1536", "1552", "9216", "16383")], self._h_jumbo, "set jumbo frame size"),
+            (CFG, [_lit("jumbo-frame"), _kw("size",
+                ("1522", "1522 bytes (standard Ethernet + tag)"), ("1536", "1536 bytes"),
+                ("1552", "1552 bytes"), ("9216", "9216 bytes (jumbo)"),
+                ("16383", "16383 bytes (maximum)"))], self._h_jumbo, "set jumbo frame size (bytes)"),
             (CFG, [_lit("ip"), _lit("igmp"), _lit("snooping")], lambda a: self._h_igmp(True), "enable IGMP snooping"),
             (CFG, [_lit("no"), _lit("ip"), _lit("igmp"), _lit("snooping")], lambda a: self._h_igmp(False), "disable IGMP snooping"),
             (CFG, [_lit("energy-efficient-ethernet")], lambda a: self._h_eee(True), "enable EEE"),
             (CFG, [_lit("no"), _lit("energy-efficient-ethernet")], lambda a: self._h_eee(False), "disable EEE"),
-            (CFG, [_lit("loopback-detection"), _kw("mode", "off", "detection", "prevention", "stp")], self._h_loop_mode, "global loop mode"),
+            (CFG, [_lit("loop-protection"), _kw("mode",
+                ("off", "No loop protection"),
+                ("loop-detection", "Detect loops and report (no blocking)"),
+                ("loop-prevention", "Detect loops and block the port"))], self._h_loop_mode, "global loop-protection mechanism"),
+            (CFG, [_lit("no"), _lit("loop-protection")], lambda a: self._h_loop_mode_off(), "disable loop protection"),
 
             # ---- QoS scheduler (global) ----------------------------------- #
             (CFG, [_lit("qos"), _lit("scheduler"), _lit("strict"), _int("queue")], self._h_sched_strict, "queue strict priority"),
             (CFG, [_lit("qos"), _lit("scheduler"), _lit("wrr"), _int("queue"), _int("weight")], self._h_sched_wrr, "queue WRR weight"),
 
             # ---- Spanning tree (global) ----------------------------------- #
-            (CFG, [_lit("spanning-tree"), _lit("mode"), _kw("mode", "stp", "rstp")], self._h_stp_mode, "STP version"),
+            (CFG, [_lit("spanning-tree"), _lit("mode"), _kw("mode",
+                ("stp", "802.1D Spanning Tree Protocol"),
+                ("rstp", "802.1w Rapid Spanning Tree Protocol"))], self._h_stp_mode, "enable STP/RSTP as the loop mechanism"),
+            (CFG, [_lit("no"), _lit("spanning-tree")], lambda a: self._h_loop_mode_off(), "disable spanning-tree (loop mechanism off)"),
             (CFG, [_lit("spanning-tree"), _lit("priority"), _int("prio")], self._h_stp_priority, "bridge priority (x4096)"),
             (CFG, [_lit("spanning-tree"), _lit("max-age"), _int("n")], lambda a: self._h_stp_timer("maxage", a["n"]), "STP max-age"),
             (CFG, [_lit("spanning-tree"), _lit("hello-time"), _int("n")], lambda a: self._h_stp_timer("hello", a["n"]), "STP hello time"),
             (CFG, [_lit("spanning-tree"), _lit("forward-time"), _int("n")], lambda a: self._h_stp_timer("delay", a["n"]), "STP forward delay"),
 
-            # ---- Link aggregation (global) -------------------------------- #
-            (CFG, [_lit("trunk"), _int("id"), _kw("mode", "static", "lacp"), _iface("ports")], self._h_trunk, "create/modify trunk group"),
-            (CFG, [_lit("no"), _lit("trunk"), _int("id")], self._h_no_trunk, "delete trunk group"),
+            # ---- Link aggregation (global) — IOS port-channel ------------- #
+            (CFG, [_lit("port-channel"), _int("id"), _lit("mode"), _kw("mode",
+                ("on", "Static aggregation, no LACP"),
+                ("active", "LACP, actively negotiate"),
+                ("passive", "LACP, respond only")),
+                _lit("interface"), _iface("ports")], self._h_trunk, "create/modify port-channel"),
+            (CFG, [_lit("no"), _lit("port-channel"), _int("id")], self._h_no_trunk, "delete port-channel"),
 
             # ---- Port mirroring (global) ---------------------------------- #
-            (CFG, [_lit("monitor"), _lit("session"), _lit("source"), _arg("src"), _kw("dir", "rx", "tx", "both"), _lit("destination"), _arg("dst")], self._h_monitor, "mirror src->dst"),
+            (CFG, [_lit("monitor"), _lit("session"), _lit("source"), _arg("src"), _kw("dir", ("rx", "Mirror received traffic"), ("tx", "Mirror transmitted traffic"), ("both", "Mirror both directions")), _lit("destination"), _arg("dst")], self._h_monitor, "mirror src->dst"),
             (CFG, [_lit("no"), _lit("monitor"), _lit("session")], self._h_no_monitor, "delete mirror session"),
 
             # ---- Static MAC / MAC table (global) -------------------------- #
@@ -1072,24 +1089,39 @@ class CLI:
             (ALL, [_lit("clear"), _lit("mac"), _lit("address-table"), _lit("dynamic")], self._h_clear_mac, "clear learned MACs"),
 
             # ---- interface-mode: speed / duplex / flow / qos / stp / etc -- #
-            (("iface",), [_lit("speed"), _kw("speed", "auto", "10", "100", "1000", "2500", "10g")], self._h_speed, "port speed"),
-            (("iface",), [_lit("duplex"), _kw("duplex", "auto", "half", "full")], self._h_duplex, "port duplex"),
-            (("iface",), [_lit("flowcontrol"), _kw("state", "on", "off")], self._h_flow, "flow control"),
+            (("iface",), [_lit("speed"), _kw("speed",
+                ("auto", "Auto-negotiate speed"), ("10", "Force 10 Mbit/s"),
+                ("100", "Force 100 Mbit/s"), ("1000", "Force 1 Gbit/s"),
+                ("2500", "Force 2.5 Gbit/s"), ("10g", "Force 10 Gbit/s (SFP+)"))],
+                self._h_speed, "port speed"),
+            (("iface",), [_lit("duplex"), _kw("duplex",
+                ("auto", "Auto-negotiate duplex"), ("half", "Half duplex (10/100M only)"),
+                ("full", "Full duplex"))], self._h_duplex, "port duplex"),
+            (("iface",), [_lit("flowcontrol"), _kw("state",
+                ("on", "Enable 802.3x flow control"),
+                ("off", "Disable flow control"))], self._h_flow, "flow control"),
             (("iface",), [_lit("qos"), _lit("priority"), _int("prio")], self._h_qos_priority, "default priority queue"),
-            (("iface",), [_lit("rate-limit"), _kw("dir", "ingress", "egress"), _int("rate")], self._h_rate_limit, "bandwidth limit (kbps)"),
-            (("iface",), [_lit("no"), _lit("rate-limit"), _kw("dir", "ingress", "egress")], self._h_no_rate_limit, "remove bandwidth limit"),
-            (("iface",), [_lit("storm-control"), _kw("kind", "broadcast", "multicast", "unknown-unicast", "unknown-multicast"), _lit("level"), _int("rate")], self._h_storm_on, "enable storm control"),
-            (("iface",), [_lit("no"), _lit("storm-control"), _kw("kind", "broadcast", "multicast", "unknown-unicast", "unknown-multicast")], self._h_storm_off, "disable storm control"),
+            (("iface",), [_lit("rate-limit"), _kw("dir", *_RL_DIR, ), _int("rate")], self._h_rate_limit, "bandwidth limit (kbps)"),
+            (("iface",), [_lit("no"), _lit("rate-limit"), _kw("dir", *_RL_DIR)], self._h_no_rate_limit, "remove bandwidth limit"),
+            (("iface",), [_lit("storm-control"), _kw("kind", *_STORM_KIND), _lit("level"), _int("rate")], self._h_storm_on, "enable storm control"),
+            (("iface",), [_lit("no"), _lit("storm-control"), _kw("kind", *_STORM_KIND)], self._h_storm_off, "disable storm control"),
             (("iface",), [_lit("isolation"), _iface("peers")], self._h_isolation, "isolate from ports"),
             (("iface",), [_lit("no"), _lit("isolation")], self._h_no_isolation, "clear isolation"),
-            (("iface",), [_lit("channel-group"), _int("id"), _kw("mode", "static", "lacp")], self._h_channel_group, "add to trunk group"),
-            (("iface",), [_lit("loop-protect")], lambda a: self._h_loop_port(True), "enable loop protect"),
-            (("iface",), [_lit("no"), _lit("loop-protect")], lambda a: self._h_loop_port(False), "disable loop protect"),
+            (("iface",), [_lit("channel-group"), _int("id"), _lit("mode"), _kw("mode",
+                ("on", "Static aggregation, no LACP"),
+                ("active", "LACP, actively negotiate"),
+                ("passive", "LACP, respond only"))], self._h_channel_group, "add to port-channel"),
+            (("iface",), [_lit("no"), _lit("channel-group")], self._h_no_channel_group, "remove from port-channel"),
+            (("iface",), [_lit("loop-protection")], lambda a: self._h_loop_port(True), "apply loop protection on this port"),
+            (("iface",), [_lit("no"), _lit("loop-protection")], lambda a: self._h_loop_port(False), "exempt this port from loop protection"),
             (("iface",), [_lit("port-security"), _lit("maximum"), _int("n")], self._h_port_security, "set MAC limit"),
             (("iface",), [_lit("no"), _lit("port-security")], self._h_no_port_security, "disable MAC limit"),
             (("iface",), [_lit("spanning-tree"), _lit("cost"), _int("cost")], self._h_stp_cost, "STP path cost"),
             (("iface",), [_lit("spanning-tree"), _lit("port-priority"), _int("prio")], self._h_stp_pport, "STP port priority"),
-            (("iface",), [_lit("spanning-tree"), _lit("link-type"), _kw("p2p", "point-to-point", "shared", "auto")], self._h_stp_p2p, "STP link type"),
+            (("iface",), [_lit("spanning-tree"), _lit("link-type"), _kw("p2p",
+                ("point-to-point", "Treat link as point-to-point (fast transition)"),
+                ("shared", "Treat link as shared (half-duplex segment)"),
+                ("auto", "Derive link type from duplex"))], self._h_stp_p2p, "STP link type"),
             (("iface",), [_lit("spanning-tree"), _lit("portfast")], lambda a: self._h_stp_edge(True), "STP edge port"),
             (("iface",), [_lit("no"), _lit("spanning-tree"), _lit("portfast")], lambda a: self._h_stp_edge(False), "clear STP edge"),
 
@@ -1400,7 +1432,9 @@ class CLI:
             if kind == "lit" and spec[1].startswith(partial):
                 rows.append((spec[1], self._token_help(completed, spec[1])))
             elif kind == "kw":
-                rows += [(c, HELP.get(c, "")) for c in spec[2] if c.startswith(partial)]
+                kwhelp = spec[3] if len(spec) > 3 else {}
+                rows += [(c, kwhelp.get(c) or HELP.get(c, ""))
+                         for c in spec[2] if c.startswith(partial)]
             elif kind == "iface":
                 rows += [
                     (n, "2.5G port" if n.startswith("Two") else "10G port")
@@ -1698,8 +1732,15 @@ class CLI:
         self.dirty = True
 
     def _h_loop_mode(self, a):
-        code = {"off": 0, "detection": 1, "prevention": 2, "stp": 3}[a["mode"]]
+        # The switch has ONE global loop mechanism (func_type): Off / Loop Detection /
+        # Loop Prevention / Spanning Tree. These three pick the non-STP options; use
+        # 'spanning-tree mode {stp|rstp}' to select Spanning Tree instead.
+        code = {"off": 0, "loop-detection": 1, "loop-prevention": 2}[a["mode"]]
         self.sw.set_loop(code)
+        self.dirty = True
+
+    def _h_loop_mode_off(self):
+        self.sw.set_loop(0)
         self.dirty = True
 
     # ---- QoS scheduler ---------------------------------------------------- #
@@ -1741,7 +1782,11 @@ class CLI:
         self.dirty = True
 
     def _h_stp_mode(self, a):
+        # Selecting an STP version also switches the switch's single global loop
+        # mechanism to Spanning Tree (func_type=3), then sets STP vs RSTP.
+        self.sw.set_loop(3)
         self._push_stp_global(version=1 if a["mode"] == "rstp" else 0)
+        self.dirty = True
 
     def _h_stp_priority(self, a):
         if a["prio"] % 4096 != 0 or not 0 <= a["prio"] <= 61440:
@@ -1752,25 +1797,40 @@ class CLI:
         self._push_stp_global(**{which: val})
 
     # ---- link aggregation ------------------------------------------------- #
+    @staticmethod
+    def _lag_type(mode):
+        """IOS channel mode -> switch trunk_type. on=static(0), active/passive=LACP(1)."""
+        return 0 if mode == "on" else 1
+
     def _h_trunk(self, a):
         try:
             ports = parse_ifrange(a["ports"])
         except ValueError as e:
             raise CmdError(f"% {e}")
         if not 1 <= a["id"] <= 2:
-            raise CmdError("% trunk id must be 1 or 2")
-        self.sw.set_trunk(a["id"], 1 if a["mode"] == "lacp" else 0, ports)
+            raise CmdError("% port-channel id must be 1 or 2 (this switch has 2 groups)")
+        self.sw.set_trunk(a["id"], self._lag_type(a["mode"]), ports)
         self.dirty = True
 
     def _h_no_trunk(self, a):
+        if not 1 <= a["id"] <= 2:
+            raise CmdError("% port-channel id must be 1 or 2")
         self.sw.delete_trunk(a["id"])
         self.dirty = True
 
     def _h_channel_group(self, a):
         if not 1 <= a["id"] <= 2:
-            raise CmdError("% trunk id must be 1 or 2")
-        self.sw.set_trunk(a["id"], 1 if a["mode"] == "lacp" else 0, self.ctx["ports"])
+            raise CmdError("% port-channel id must be 1 or 2 (this switch has 2 groups)")
+        self.sw.set_trunk(a["id"], self._lag_type(a["mode"]), self.ctx["ports"])
         self.dirty = True
+
+    def _h_no_channel_group(self, a):
+        # IOS removes the port from whatever group it's in. The switch deletes by group
+        # and re-adds by full member list, so we can't surgically drop one port without
+        # re-reading group membership, which this firmware does not expose cleanly.
+        raise CmdError("% This switch cannot remove a single port from a group via the API; "
+                       "use 'no port-channel <id>' to delete the whole group, then "
+                       "recreate it with the remaining ports.")
 
     # ---- mirroring -------------------------------------------------------- #
     def _h_monitor(self, a):
@@ -1832,7 +1892,11 @@ class CLI:
         self.dirty = True
 
     def _h_duplex(self, a):
-        # Combine with current rate: only 10/100 have half; 'full'/'auto' map within capability.
+        # The switch has no independent duplex field — speed and duplex share one code.
+        # We read the port's current speed and recombine. On dry-run we cannot read it,
+        # so warn that the emitted code assumes the current rate is Auto.
+        if self.sw.dry_run and a["duplex"] != "auto":
+            print("  (dry-run: cannot read current speed; assuming Auto for the combined code)")
         for p in self.ctx["ports"]:
             en, sp, fl = self._port_state(p)
             d = a["duplex"]

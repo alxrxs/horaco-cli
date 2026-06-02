@@ -109,7 +109,7 @@ show spanning-tree                # loop protocol + STP global + STP per-port
 show qos                          # port-to-queue + queue scheduler
 show storm-control                # per-port storm filters
 show ip igmp snooping             # IGMP snooping state + entries
-show trunk                        # link-aggregation groups
+show etherchannel summary         # port-channel (link-aggregation) groups
 show monitor                      # port mirroring session
 show isolation                    # port isolation matrix
 show jumbo-frame                  # configured jumbo MTU
@@ -124,14 +124,18 @@ show port-security                # per-port MAC-count limits
 jumbo-frame {1522|1536|1552|9216|16383}      # max frame size
 ip igmp snooping / no ip igmp snooping       # IGMP snooping
 energy-efficient-ethernet / no ...           # 802.3az EEE
-loopback-detection {off|detection|prevention|stp}   # global loop protocol mode
-qos scheduler strict <queue>                 # queue 1-8 -> strict priority
-qos scheduler wrr <queue> <weight>           # queue 1-8, weight 1-15 (WRR)
-spanning-tree mode {stp|rstp}
+# The switch has ONE global loop mechanism. Pick a non-STP mode here, or pick STP
+# below — they are mutually exclusive (the same hardware "Loop function" selector).
+loop-protection {off|loop-detection|loop-prevention}   # global loop mechanism
+no loop-protection                           # mechanism off
+spanning-tree mode {stp|rstp}                # set loop mechanism = Spanning Tree, + version
+no spanning-tree                             # loop mechanism off
 spanning-tree priority <0-61440 step 4096>   # bridge priority
 spanning-tree max-age <sec> / hello-time <sec> / forward-time <sec>
-trunk <1-2> {static|lacp} <iface-range>      # create / modify a LAG group
-no trunk <1-2>                               # delete a LAG group
+qos scheduler strict <queue>                 # queue 1-8 -> strict priority
+qos scheduler wrr <queue> <weight>           # queue 1-8, weight 1-15 (WRR)
+port-channel <1-2> mode {on|active|passive} interface <iface-range>   # create/modify LAG
+no port-channel <1-2>                        # delete the group
 monitor session source <iface> {rx|tx|both} destination <iface>   # port mirror
 no monitor session                           # delete mirror
 mac address-table static <MAC> vlan <vid> interface <iface>       # static MAC
@@ -158,8 +162,8 @@ rate-limit {ingress|egress} <kbps> / no rate-limit {ingress|egress}
 storm-control {broadcast|multicast|unknown-unicast|unknown-multicast} level <kbps>
 no storm-control {broadcast|multicast|unknown-unicast|unknown-multicast}
 isolation <iface-range> / no isolation       # block forwarding to listed ports
-channel-group <1-2> {static|lacp}            # add this port to a LAG group
-loop-protect / no loop-protect               # per-port loop protection
+channel-group <1-2> mode {on|active|passive} # add this port to a port-channel
+loop-protection / no loop-protection         # apply/exempt the global loop mechanism here
 port-security maximum <n> / no port-security # per-port learned-MAC limit
 spanning-tree cost <0-200000000>             # 0 = auto
 spanning-tree port-priority <0-240 step 16>
