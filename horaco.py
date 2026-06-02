@@ -2211,7 +2211,6 @@ def read_line(cli, prompt_str):
 def repl(cli):
     interactive = sys.stdin.isatty() and sys.stdout.isatty()
     print(f"Connected to {cli.sw.name} ({cli.sw.host}).")
-    print("IOS-like CLI: '?' shows options live, <Tab> completes, abbreviations work (e.g. 'sh vl', 'tw1').")
     while True:
         try:
             if interactive:
