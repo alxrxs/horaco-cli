@@ -396,18 +396,6 @@ class Switch:
         data.append(("vlan_accept_frame_type", str(accept_code)))
         self._post("/vlan.cgi?page=port_based", data)
 
-    def set_port_admin(self, port, enable):
-        self._post(
-            "/port.cgi",
-            {
-                "portid": str(port - 1),
-                "state": "1" if enable else "0",
-                "speed_duplex": "0",  # 0 = Auto
-                "flow": "0",
-                "cmd": "port",
-            },
-        )
-
     def save(self):
         self._post("/save.cgi", {"cmd": "save"})
 
@@ -465,15 +453,19 @@ class Switch:
         cells = [c.strip() for c in
                  re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "|", self._get("/port.cgi"))).split("|")
                  if c.strip()]
+        # The status table rows are 6 cells each:
+        #   Port N | State | Config-speed | Actual-speed | Flow-cfg | Flow-actual
+        # Only treat a "Port N" as a row when the next cell is an admin state, so we skip
+        # the config-form port <select> options (Port 1..6 with no State after them).
         out = {}
         i = 0
         while i < len(cells):
             m = re.fullmatch(r"Port (\d+)", cells[i])
-            if m and i + 6 < len(cells):
+            if m and i + 4 < len(cells) and cells[i + 1] in ("Enable", "Disable"):
                 p = int(m.group(1))
                 out[p] = {"state": cells[i + 1], "cfg_speed": cells[i + 2],
                           "act_speed": cells[i + 3], "flow_cfg": cells[i + 4]}
-                i += 7
+                i += 6
                 continue
             i += 1
         return out
@@ -1314,7 +1306,10 @@ class CLI:
                     return ("fail", None, None, None)
                 lits += 1
             elif kind == "kw":
-                ms = [c for c in spec[2] if c.startswith(tok)]
+                if tok in spec[2]:  # exact full match wins over longer prefixes (e.g. '10' vs '100'/'1000'/'10g')
+                    ms = [tok]
+                else:
+                    ms = [c for c in spec[2] if c.startswith(tok)]
                 if len(ms) != 1:
                     return ("fail", None, None, None)
                 args[spec[1]] = ms[0]
@@ -1515,13 +1510,17 @@ class CLI:
         save_descriptions(self.sw.name, self.desc)
 
     def _h_shutdown(self, a):
+        # port.cgi posts state+speed+flow together, so preserve the configured
+        # speed/flow when toggling admin state (don't reset the port to Auto).
         for p in self.ctx["ports"]:
-            self.sw.set_port_admin(p, False)
+            _en, sp, fl = self._port_state(p)
+            self.sw.set_port_cfg(p, False, sp, fl)
         self.dirty = True
 
     def _h_no_shutdown(self, a):
         for p in self.ctx["ports"]:
-            self.sw.set_port_admin(p, True)
+            _en, sp, fl = self._port_state(p)
+            self.sw.set_port_cfg(p, True, sp, fl)
         self.dirty = True
 
     def _h_access(self, a):
