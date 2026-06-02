@@ -519,10 +519,122 @@ class Switch:
                  ("p2p", p2p), ("edge", edge), ("cmd", "stp_port")]
         self._post("/loop.cgi?page=stp_port", data)
 
+    @staticmethod
+    def _cells(html, tags="td"):
+        """Strip <script>/<style>, return list of stripped tag-cell texts."""
+        html = re.sub(r"<script\b.*?</script>", "", html, flags=re.S | re.I)
+        html = re.sub(r"<style\b.*?</style>", "", html, flags=re.S | re.I)
+        html = html.replace("&nbsp;", " ")
+        out = []
+        for m in re.finditer(rf"<(?:{tags})\b[^>]*>(.*?)</(?:{tags})>", html, re.S | re.I):
+            out.append(re.sub(r"<[^>]+>", "", m.group(1)).strip())
+        return out
+
+    @staticmethod
+    def _selected_option(html, name):
+        """Value of the `selected` <option> inside <select name="...">."""
+        m = re.search(rf'<select\b[^>]*name="{name}"[^>]*>(.*?)</select>', html, re.S | re.I)
+        if not m:
+            return None
+        opt = re.search(r'<option\s+value="?([^">\s]+)"?[^>]*\bselected\b', m.group(1), re.I)
+        return opt.group(1) if opt else None
+
+    @staticmethod
+    def _input_value(html, name):
+        m = re.search(rf'name="{name}"[^>]*value="([^"]*)"', html)
+        return m.group(1) if m else ""
+
+    _LOOP_FUNC = {"0": "Off", "1": "Loop Detection",
+                  "2": "Loop Prevention", "3": "Spanning Tree"}
+
     def fetch_loop(self):
-        return {"loop": self._text_lines("/loop.cgi"),
-                "stp_global": self._text_lines("/loop.cgi?page=stp_global"),
-                "stp_port": self._text_lines("/loop.cgi?page=stp_port")}
+        """Structured loop/STP state.
+
+        Returns dict:
+          func        decoded loop-function name
+          func_code   raw selector value ('0'..'3')
+          interval, recover   seconds (strings)
+          loop_ports  [{port,enable,status}]
+          stp_global  {version,priority,maxage,hello,delay,root:{...}}
+          stp_port    [{port,state,role,path_cost,priority}]
+        """
+        loop_html = self._get("/loop.cgi")
+        func_code = self._selected_option(loop_html, "func_type") or "0"
+        out = {
+            "func_code": func_code,
+            "func": self._LOOP_FUNC.get(func_code, func_code),
+            "interval": self._input_value(loop_html, "interval_time"),
+            "recover": self._input_value(loop_html, "recover_time"),
+            "loop_ports": [],
+        }
+        # Per-port loop status table: rows of  Port N | <Enable|Disable> | <status>
+        cells = self._cells(loop_html)
+        i = 0
+        while i < len(cells):
+            m = re.fullmatch(r"Port (\d+)", cells[i])
+            if m and i + 2 < len(cells) and cells[i + 1] in ("Enable", "Disable"):
+                out["loop_ports"].append({
+                    "port": int(m.group(1)),
+                    "enable": cells[i + 1],
+                    "status": cells[i + 2],
+                })
+                i += 3
+                continue
+            i += 1
+
+        # ---- STP global (renders regardless of active mode) ---------------- #
+        g_html = self._get("/loop.cgi?page=stp_global")
+        ver_code = self._selected_option(g_html, "version") or "0"
+        # Read-only root info: each <th> label is followed by its <td> value.
+        all_cells = re.findall(r"<(th|td)\b[^>]*>(.*?)</\1>", g_html, re.S | re.I)
+        flat = [(t.lower(), re.sub(r"<[^>]+>", "", c).replace("&nbsp;", " ").strip())
+                for t, c in all_cells]
+        lv = {}
+        for j in range(len(flat) - 1):
+            if flat[j][0] == "th" and flat[j + 1][0] == "td":
+                lv[flat[j][1]] = flat[j + 1][1]
+        out["stp_global"] = {
+            "version": "RSTP" if ver_code == "1" else "STP",
+            "priority": self._selected_option(g_html, "priority") or "?",
+            "maxage": self._input_value(g_html, "maxage"),
+            "hello": self._input_value(g_html, "hello"),
+            "delay": self._input_value(g_html, "delay"),
+            "root": {
+                "priority": lv.get("Root Priority", "-"),
+                "mac": lv.get("Root MAC Address", "-"),
+                "cost": lv.get("Root Path Cost", "-"),
+                "port": lv.get("Root Port", "-"),
+            },
+        }
+
+        # ---- STP per-port -------------------------------------------------- #
+        # Status rows are exactly 10 cells anchored on "Port N":
+        #   Port N | State | Role | PathCost(cfg) | PathCost(actual) |
+        #   Priority | P2P(cfg) | P2P(actual) | Edge(cfg) | Edge(actual)
+        p_html = self._get("/loop.cgi?page=stp_port")
+        pcells = self._cells(p_html)
+        out["stp_port"] = []
+        states = ("Forwarding", "Blocking", "Listening", "Learning",
+                  "Disabled", "Discarding", "Disable")
+        i = 0
+        while i < len(pcells):
+            m = re.fullmatch(r"Port (\d+)", pcells[i])
+            # Real status rows have a port-state in the next cell; the config-form
+            # multi-select collapses to one non-"Port N" cell and is skipped.
+            if m and i + 9 < len(pcells) and pcells[i + 1] in states:
+                cfg_cost, act_cost = pcells[i + 3], pcells[i + 4]
+                cost = act_cost if re.fullmatch(r"\d+", act_cost) else cfg_cost
+                out["stp_port"].append({
+                    "port": int(m.group(1)),
+                    "state": pcells[i + 1],
+                    "role": pcells[i + 2],
+                    "path_cost": cost,
+                    "priority": pcells[i + 5],
+                })
+                i += 10
+                continue
+            i += 1
+        return out
 
     # ===================================================================== #
     #  IGMP snooping
@@ -620,10 +732,23 @@ class Switch:
     #  MAC address table / static MAC / port security
     # ===================================================================== #
     def fetch_mac_table(self):
-        """Return {'raw': lines, 'macs': rows} from the dynamic forwarding table."""
-        lines = self._text_lines("/mac.cgi?page=fwd_tbl")
-        rows = [ln for ln in lines if re.match(r"[0-9A-Fa-f:]{17}", ln)]
-        return {"raw": lines, "macs": rows}
+        """Return {'macs': [{'mac','vlan','type','port'}]} from the dynamic table.
+
+        Columns are  No. | MAC Address | VLAN ID | Type | Port; for each cell
+        that is a MAC, the next three cells are VLAN, Type, Port.
+        """
+        cells = self._cells(self._get("/mac.cgi?page=fwd_tbl"))
+        mac_re = re.compile(r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}")
+        rows = []
+        for i, c in enumerate(cells):
+            if mac_re.fullmatch(c) and i + 3 < len(cells):
+                rows.append({
+                    "mac": c,
+                    "vlan": cells[i + 1],
+                    "type": cells[i + 2],
+                    "port": cells[i + 3],
+                })
+        return {"macs": rows}
 
     def clear_mac_table(self):
         self._post("/mac.cgi?page=fwd_tbl", {"cmd": "mactblclr"})
@@ -1620,11 +1745,17 @@ class CLI:
         print(f"DHCP client   : {'enabled' if ip['dhcp'] == '1' else 'disabled'}")
 
     def show_mac_table(self):
-        t = self.sw.fetch_mac_table()
-        if not t["macs"]:
-            print("(no dynamic MAC entries — or table parsed empty)")
-        for ln in t["macs"]:
-            print(ln)
+        rows = self.sw.fetch_mac_table()["macs"]
+        if not rows:
+            print("No dynamic MAC entries.")
+            return
+        print(f"{'MAC Address':<18}  {'VLAN':>4}  {'Type':<9}  Port")
+        for r in rows:
+            try:
+                iface = port_short(int(r["port"]))
+            except (ValueError, TypeError):
+                iface = r["port"]
+            print(f"{r['mac']:<18}  {r['vlan']:>4}  {r['type']:<9}  {iface}")
 
     def show_static_mac(self):
         for ln in self.sw.fetch_static_mac():
@@ -1632,9 +1763,28 @@ class CLI:
 
     def show_stp(self):
         d = self.sw.fetch_loop()
-        print("== Loop protocol =="); [print(" ", l) for l in d["loop"]]
-        print("== STP global ==");    [print(" ", l) for l in d["stp_global"]]
-        print("== STP port ==");      [print(" ", l) for l in d["stp_port"]]
+        print(f"Loop protocol: {d['func']}   "
+              f"(interval {d['interval']}s, recover {d['recover']}s)")
+        if d["loop_ports"]:
+            print()
+            print(f"{'Port':<6} {'State':<8} Loop-Status")
+            for p in d["loop_ports"]:
+                print(f"{port_short(p['port']):<6} {p['enable']:<8} {p['status']}")
+
+        g = d["stp_global"]
+        active = "yes" if d["func_code"] == "3" else "no"
+        print()
+        print(f"Spanning Tree: version {g['version']}, "
+              f"bridge-priority {g['priority']}, max-age {g['maxage']}, "
+              f"hello {g['hello']}, fwd-delay {g['delay']}  (active: {active})")
+        r = g["root"]
+        print(f"  Root: priority {r['priority']}  mac {r['mac']}  "
+              f"cost {r['cost']}  port {r['port']}")
+        if d["stp_port"]:
+            print(f"{'Port':<6} {'State':<11} {'Role':<9} {'PathCost':<9} Prio")
+            for p in d["stp_port"]:
+                print(f"{port_short(p['port']):<6} {p['state']:<11} "
+                      f"{p['role']:<9} {p['path_cost']:<9} {p['priority']}")
 
     def show_qos(self):
         d = self.sw.fetch_qos()
