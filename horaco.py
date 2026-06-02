@@ -867,7 +867,7 @@ HELP = {
     "username": "Set the admin account username + password",
     "mac": "MAC address-table / static MAC",
     "address-table": "Layer-2 MAC forwarding table",
-    "static": "Static MAC entry / static trunk",
+    "static": "Static (non-protocol) entry / aggregation",
     "dynamic": "Dynamic (learned) MAC entries",
     "clear": "Clear / reset a table or counters",
     # interface-level new
@@ -923,6 +923,36 @@ HELP = {
     "factory-reset": "Restore factory defaults (disruptive)",
     "config": "Configuration file",
     "table": "Table output",
+    # enumerated keyword-choice values shown by '?'
+    "stp": "802.1D Spanning Tree Protocol",
+    "rstp": "802.1w Rapid Spanning Tree Protocol",
+    "lacp": "Dynamic LACP aggregation",
+    "rx": "Mirror received (ingress) traffic",
+    "tx": "Mirror transmitted (egress) traffic",
+    "both": "Mirror both directions",
+    "auto": "Auto-negotiate",
+    "half": "Half duplex",
+    "full": "Full duplex",
+    "on": "Enable",
+    "off": "Disable",
+    "10": "10 Mbit/s",
+    "100": "100 Mbit/s",
+    "1000": "1 Gbit/s",
+    "2500": "2.5 Gbit/s",
+    "10g": "10 Gbit/s",
+    "point-to-point": "Point-to-point link",
+    "shared": "Shared (half-duplex) link",
+    "detection": "Loop detection (report only)",
+    "prevention": "Loop prevention (block port)",
+    "level": "Storm threshold rate",
+    "strict": "Strict-priority scheduling",
+    "ingress": "Received (ingress) direction",
+    "egress": "Transmitted (egress) direction",
+    "1522": "1522 bytes (standard)",
+    "1536": "1536 bytes",
+    "1552": "1552 bytes",
+    "9216": "9216 bytes",
+    "16383": "16383 bytes (max)",
 }
 ARG_HELP = {
     "vid": "<1-4094>  VLAN ID", "list": "<vlan-list>  e.g. 10,12,777",
@@ -931,6 +961,9 @@ ARG_HELP = {
     "n": "<integer>", "rate": "<kbps>", "mac": "<HH:HH:HH:HH:HH:HH>",
     "id": "<group-id 1-2>", "cost": "<0-200000000, 0=auto>",
     "prio": "<priority>", "size": "<bytes>", "file": "<path>",
+    "weight": "<1-15>  WRR weight", "queue": "<1-8>  egress queue",
+    "addr": "<A.B.C.D>", "if": "<interface>", "src": "<interface>",
+    "dst": "<interface>", "ports": "<interface-range>", "peers": "<interface-range>",
 }
 
 
@@ -1406,7 +1439,7 @@ class CLI:
             print("% No matching options")
             return
         for tok, desc in rows:
-            print(f"  {tok:<24}{desc}")
+            print(f"  {tok:<28}{desc}")
 
     # ---- handlers --------------------------------------------------------- #
     def _h_configure(self, a):
@@ -2020,7 +2053,7 @@ def read_line(cli, prompt_str):
         rows = cli.help_rows(completed, partial) if completed is not None else []
         if rows:
             for tok, desc in rows:
-                out.write(f"  {tok:<24}{desc}\n")
+                out.write(f"  {tok:<28}{desc}\n")
         else:
             out.write("  % No matching options\n")
         redraw()
