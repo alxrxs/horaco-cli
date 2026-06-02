@@ -161,6 +161,19 @@ def fmt_portlist(ports):
 ACCEPT_NAMES = {0: "all", 1: "tag-only", 2: "untag-only"}
 ACCEPT_CODES = {"all": 0, "tag-only": 1, "untag-only": 2, "tag": 1, "untag": 2}
 
+# Speed/duplex select codes (port.cgi). 2.5G ports accept 0-6; 10G ports 0,4,5,6,8.
+SPEED_CODES = {
+    "auto": 0, "10half": 1, "10full": 2, "100half": 3, "100full": 4,
+    "1000": 5, "1000full": 5, "2500": 6, "2500full": 6, "10g": 8, "10gfull": 8,
+}
+# IOS-flavoured 'speed' keyword -> (code) ; duplex handled separately for 10/100.
+JUMBO_CODES = {"1522": 0, "1536": 1, "1552": 2, "9216": 3, "16383": 4}
+STORM_CODES = {  # IOS-ish storm-control keyword -> switch storm_filter value
+    "unknown-unicast": 0, "unknown-multicast": 1, "multicast": 2, "broadcast": 3,
+}
+MIRROR_DIR = {"rx": 1, "tx": 2, "both": 3}
+# STP port priority must be a multiple of 16 (0..240); global priority multiple of 4096.
+
 # Physical port capability for the ZX-SWTG124AS: ports 1-4 are 2.5G, 5-6 are 10G(SFP+).
 def desc_file():
     """Sidecar path for port descriptions — lives beside the inventory, not in the tool."""
@@ -402,6 +415,295 @@ class Switch:
         txt = re.sub(r"<[^>]*>", "", self._get("/info.cgi"))
         return [l.strip() for l in txt.splitlines() if l.strip()]
 
+    # -- generic page text scrape helper ----------------------------------- #
+    def _text_lines(self, path):
+        html = self._get(path)
+        html = re.sub(r"<script\b.*?</script>", "", html, flags=re.S | re.I)
+        html = re.sub(r"<style\b.*?</style>", "", html, flags=re.S | re.I)
+        txt = re.sub(r"<[^>]*>", "\n", html)
+        return [l.strip() for l in txt.splitlines() if l.strip()]
+
+    # ===================================================================== #
+    #  System: IP / user / port speed-duplex-flow
+    # ===================================================================== #
+    def fetch_ip(self):
+        """Return {'ip','netmask','gateway','dhcp'} from ip.cgi."""
+        html = self._get("/ip.cgi")
+        def val(name):
+            m = re.search(rf'name="{name}"[^>]*value="([^"]*)"', html)
+            return m.group(1) if m else ""
+        dhcp = "1" if re.search(r'name="dhcp_state".*?<option value="1"[^>]*selected', html, re.S) else "0"
+        return {"ip": val("ip"), "netmask": val("netmask"),
+                "gateway": val("gateway"), "dhcp": dhcp}
+
+    def set_ip(self, ip, netmask, gateway, dhcp):
+        """DANGEROUS: changes management IP. dhcp 0/1."""
+        self._post("/ip.cgi", {
+            "ip": ip, "netmask": netmask, "gateway": gateway,
+            "dhcp_state": str(dhcp), "cmd": "ip",
+        })
+
+    def set_user(self, username, password):
+        """DANGEROUS: changes admin credentials."""
+        self._post("/user.cgi", {
+            "mname": username, "mpass": password, "mpass2": password,
+            "cmd": "passwd",
+        })
+
+    def set_port_cfg(self, port, enable, speed_code, flow):
+        """Full per-port config: state, speed/duplex code, flow control (0/1)."""
+        self._post("/port.cgi", {
+            "portid": str(port - 1),
+            "state": "1" if enable else "0",
+            "speed_duplex": str(speed_code),
+            "flow": str(flow),
+            "cmd": "port",
+        })
+
+    def fetch_port_cfg(self):
+        """port -> {'state','cfg_speed','act_speed','flow_cfg'} (config columns)."""
+        cells = [c.strip() for c in
+                 re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "|", self._get("/port.cgi"))).split("|")
+                 if c.strip()]
+        out = {}
+        i = 0
+        while i < len(cells):
+            m = re.fullmatch(r"Port (\d+)", cells[i])
+            if m and i + 6 < len(cells):
+                p = int(m.group(1))
+                out[p] = {"state": cells[i + 1], "cfg_speed": cells[i + 2],
+                          "act_speed": cells[i + 3], "flow_cfg": cells[i + 4]}
+                i += 7
+                continue
+            i += 1
+        return out
+
+    # ===================================================================== #
+    #  QoS
+    # ===================================================================== #
+    def set_port_priority(self, ports, prio_code):
+        data = [("portid", str(p - 1)) for p in ports]
+        data += [("port_priority", str(prio_code)), ("cmd", "portprio")]
+        self._post("/qos.cgi?page=port_pri", data)
+
+    def set_queue_weight(self, queues, weight):
+        """queues: iterable of 1-based queue ids (1-8). weight 0=strict, 1-15."""
+        data = [("queueid", str(q - 1)) for q in queues]
+        data += [("weight", str(weight)), ("cmd", "qweight")]
+        self._post("/qos.cgi?page=que_weight", data)
+
+    def fetch_qos(self):
+        return {"port_pri": self._text_lines("/qos.cgi?page=port_pri"),
+                "sched": self._text_lines("/qos.cgi?page=pkt_sch")}
+
+    # ===================================================================== #
+    #  Loop protection / STP
+    # ===================================================================== #
+    def set_loop(self, func_type, interval=2, recover=10):
+        """func_type: 0 Off, 1 Loop Detection, 2 Loop Prevention, 3 Spanning Tree."""
+        self._post("/loop.cgi", {
+            "func_type": str(func_type),
+            "interval_time": str(interval), "recover_time": str(recover),
+            "cmd": "loop",
+        })
+
+    def set_loop_port(self, ports, enable):
+        data = [("portid", str(p - 1)) for p in ports]
+        data += [("portEnable", "1" if enable else "0"), ("cmd", "rlp")]
+        self._post("/loop_port.cgi", data)
+
+    def set_stp_global(self, version, priority, maxage=20, hello=2, delay=15):
+        """version: 0 STP, 1 RSTP. priority multiple of 4096."""
+        self._post("/loop.cgi?page=stp_global", {
+            "version": str(version), "priority": str(priority),
+            "maxage": str(maxage), "hello": str(hello), "delay": str(delay),
+            "cmd": "stp",
+        })
+
+    def set_stp_port(self, ports, cost, priority, p2p, edge):
+        """cost int (0=auto). priority 0-240 step16. p2p: false/true/auto. edge: false/true."""
+        data = [("portid", str(p - 1)) for p in ports]
+        data += [("cost", str(cost)), ("priority", str(priority)),
+                 ("p2p", p2p), ("edge", edge), ("cmd", "stp_port")]
+        self._post("/loop.cgi?page=stp_port", data)
+
+    def fetch_loop(self):
+        return {"loop": self._text_lines("/loop.cgi"),
+                "stp_global": self._text_lines("/loop.cgi?page=stp_global"),
+                "stp_port": self._text_lines("/loop.cgi?page=stp_port")}
+
+    # ===================================================================== #
+    #  IGMP snooping
+    # ===================================================================== #
+    def set_igmp(self, enable):
+        data = {"cmd": "enable_igmp"}
+        if enable:
+            data["enable_igmp"] = "on"
+        self._post("/igmp.cgi?page=enable_igmp", data)
+
+    def fetch_igmp(self):
+        html = self._get("/igmp.cgi?page=dump")
+        on = bool(re.search(r'name="enable_igmp"[^>]*checked', html))
+        return {"enabled": on, "lines": self._text_lines("/igmp.cgi?page=dump")}
+
+    # ===================================================================== #
+    #  Link aggregation (trunk)
+    # ===================================================================== #
+    def set_trunk(self, group_id, trunk_type, ports):
+        """group_id 1/2; trunk_type 0 static / 1 LACP; ports 1-based set."""
+        data = [("id", str(group_id)), ("trunk_type", str(trunk_type))]
+        data += [("ports", str(p - 1)) for p in ports]
+        data.append(("cmd", "trunk"))
+        self._post("/trunk.cgi?page=group", data)
+
+    def delete_trunk(self, group_id):
+        self._post("/trunk.cgi?page=group_remove",
+                   {f"remove_{group_id}": "on", "cmd": "group_remove"})
+
+    def fetch_trunk(self):
+        return self._text_lines("/trunk.cgi?page=group")
+
+    # ===================================================================== #
+    #  Port mirroring / isolation / bandwidth
+    # ===================================================================== #
+    def set_mirror(self, direction, dest_port, source_port):
+        """direction 1 Rx / 2 Tx / 3 Both. dest 0-based value; source 'Port N'."""
+        self._post("/port.cgi?page=mirroring", {
+            "mirror_direction": str(direction),
+            "mirroring_port": str(dest_port - 1),
+            "mirrored_port": f"Port {source_port}",
+            "cmd": "mirror",
+        })
+
+    def delete_mirror(self):
+        self._post("/port.cgi?page=delete_mirror", {"cmd": "del_mirror"})
+
+    def set_isolation(self, ports, isolated_from):
+        """Ports `ports` are isolated from ports `isolated_from` (both 1-based sets)."""
+        data = [("port", f"Port {p}") for p in ports]
+        data += [("isolationlist", f"Port {p}") for p in isolated_from]
+        data.append(("cmd", "portisolation"))
+        self._post("/port.cgi?page=isolation", data)
+
+    def set_bw(self, ports, direction, state, rate):
+        """direction 0 ingress / 1 egress. state 0/1. rate kbit/sec (ignored if disabled)."""
+        data = [("portid", str(p - 1)) for p in ports]
+        data += [("type", str(direction)), ("state", str(state)),
+                 ("rate", str(rate)), ("cmd", "bandwidthcontrol")]
+        self._post("/port.cgi?page=bwctrl", data)
+
+    def fetch_mirror(self):
+        return self._text_lines("/port.cgi?page=mirroring")
+
+    def fetch_isolation(self):
+        return self._text_lines("/port.cgi?page=isolation")
+
+    def fetch_bw(self):
+        return self._text_lines("/port.cgi?page=bw_ctrl")
+
+    # ===================================================================== #
+    #  Forwarding: jumbo frame / storm control
+    # ===================================================================== #
+    def set_jumbo(self, code):
+        """code 0=1522,1=1536,2=1552,3=9216,4=16383."""
+        self._post("/fwd.cgi?page=jumboframe", {"jumboframe": str(code), "cmd": "jumboframe"})
+
+    def fetch_jumbo(self):
+        html = self._get("/fwd.cgi?page=jumboframe")
+        m = re.search(r'<option value="(\d+)"[^>]*selected[^>]*>\s*(\d+)', html)
+        return m.group(2) if m else "?"
+
+    def set_storm(self, storm_filter, ports, action, rate):
+        """storm_filter: 0 unknown-unicast,1 unknown-multicast,2 known-multicast,3 broadcast.
+        action 0 off / 1 on. ports 1-based. rate kbps."""
+        data = [("storm_filter", str(storm_filter))]
+        data += [("portid", f"Port {p}") for p in ports]
+        data += [("action", str(action)), ("rate", str(rate)), ("cmd", "storm")]
+        self._post("/fwd.cgi?page=storm_ctrl", data)
+
+    def fetch_storm(self):
+        return self._text_lines("/fwd.cgi?page=storm_ctrl")
+
+    # ===================================================================== #
+    #  MAC address table / static MAC / port security
+    # ===================================================================== #
+    def fetch_mac_table(self):
+        """Return {'raw': lines, 'macs': rows} from the dynamic forwarding table."""
+        lines = self._text_lines("/mac.cgi?page=fwd_tbl")
+        rows = [ln for ln in lines if re.match(r"[0-9A-Fa-f:]{17}", ln)]
+        return {"raw": lines, "macs": rows}
+
+    def clear_mac_table(self):
+        self._post("/mac.cgi?page=fwd_tbl", {"cmd": "mactblclr"})
+
+    def add_static_mac(self, mac, vlan, port):
+        self._post("/mac.cgi?page=static", {
+            "mac": mac, "vlan": str(vlan), "src": str(port - 1), "cmd": "macstatic",
+        })
+
+    def delete_static_mac(self, idx):
+        self._post("/mac.cgi?page=staticdel",
+                   {f"remove_{idx}": "on", "cmd": "macstatictbl"})
+
+    def fetch_static_mac(self):
+        return self._text_lines("/mac.cgi?page=static")
+
+    def set_mac_constraint(self, ports, state, limit):
+        """Per-port MAC count limit (port security). state 0/1, limit int."""
+        data = [("portid", str(p - 1)) for p in ports]
+        data += [("state", str(state)), ("limit", str(limit)), ("cmd", "mac_constraint")]
+        self._post("/mac_constraint.cgi", data)
+
+    def fetch_mac_constraint(self):
+        return self._text_lines("/mac_constraint.cgi")
+
+    # ===================================================================== #
+    #  EEE
+    # ===================================================================== #
+    def set_eee(self, enable):
+        self._post("/eee.cgi", {"func_type": "1" if enable else "0", "cmd": "loop"})
+
+    def fetch_eee(self):
+        html = self._get("/eee.cgi")
+        return bool(re.search(r'name="func_type".*?<option value="1"[^>]*selected', html, re.S))
+
+    # ===================================================================== #
+    #  Tools: config backup / restore, firmware, reboot, factory reset
+    # ===================================================================== #
+    def backup_config(self, dest_path):
+        """Download the binary config blob (GET, safe)."""
+        if not self._logged_in:
+            self.login()
+        r = self.s.get(self._base + "/config_back.cgi?cmd=conf_backup", timeout=self.timeout)
+        r.raise_for_status()
+        with open(dest_path, "wb") as fh:
+            fh.write(r.content)
+        return len(r.content)
+
+    def restore_config(self, src_path):
+        """DANGEROUS: upload a config blob (multipart)."""
+        if self.dry_run:
+            print(f"  DRY-RUN POST /config_back.cgi?cmd=conf_restore  <file {src_path}>")
+            return
+        if not self._logged_in:
+            self.login()
+        with open(src_path, "rb") as fh:
+            self.s.post(self._base + "/config_back.cgi?cmd=conf_restore",
+                        files={"submitFile": (os.path.basename(src_path), fh)},
+                        timeout=self.timeout).raise_for_status()
+
+    def firmware_upgrade(self):
+        """DANGEROUS: enters bootloader for firmware upload."""
+        self._post("/fwug.cgi", {"cmd": "enter_loader"})
+
+    def reboot(self):
+        """DANGEROUS: reboot the switch."""
+        self._post("/reboot.cgi", {"cmd": "reboot"})
+
+    def factory_reset(self):
+        """DANGEROUS: restore factory defaults."""
+        self._post("/reset.cgi", {"cmd": "factory_default"})
+
 
 # --------------------------------------------------------------------------- #
 # Interface naming — Cisco-style media types
@@ -486,6 +788,15 @@ class CmdError(Exception):
     """Raised by the grammar resolver for unknown/incomplete/ambiguous input."""
 
 
+def _confirm(prompt_text):
+    """Interactive [y/N] gate for disruptive actions. Returns True only on explicit yes."""
+    try:
+        ans = input(f"{prompt_text} [y/N] ")
+    except EOFError:
+        return False
+    return ans.strip().lower().startswith("y")
+
+
 # Token-spec constructors used in the grammar table below.
 def _lit(w):
     return ("lit", w)
@@ -501,6 +812,11 @@ def _int(name):
 
 def _rest(name, hint=""):
     return ("rest", name, hint)
+
+
+def _arg(name):
+    """A single positional token (not abbreviated, not joined)."""
+    return ("arg", name)
 
 
 def _iface(name="range"):
@@ -544,8 +860,78 @@ HELP = {
     "allowed": "VLANs carried on the trunk",
     "add": "Add to the current set",
     "remove": "Remove from the current set",
+    # system / ip / user
+    "ip": "IP / management / IGMP settings",
+    "address": "Set management IP address",
+    "dhcp": "Obtain management IP via DHCP",
+    "username": "Set the admin account username + password",
+    "mac": "MAC address-table / static MAC",
+    "address-table": "Layer-2 MAC forwarding table",
+    "static": "Static MAC entry / static trunk",
+    "dynamic": "Dynamic (learned) MAC entries",
+    "clear": "Clear / reset a table or counters",
+    # interface-level new
+    "speed": "Set port speed (auto/10/100/1000/2500/10g)",
+    "duplex": "Set port duplex (auto/half/full)",
+    "flowcontrol": "Set 802.3x flow control (on/off)",
+    "priority": "QoS port-default priority (queue) 1-8",
+    "storm-control": "Per-port storm control",
+    "rate-limit": "Per-port ingress/egress bandwidth limit",
+    "ingress": "Ingress (received) direction",
+    "egress": "Egress (transmitted) direction",
+    "isolation": "Port isolation (block forwarding to listed ports)",
+    "channel-group": "Add port to a link-aggregation trunk group",
+    "spanning-tree": "STP/RSTP settings",
+    "cost": "STP path cost (0 = auto)",
+    "port-priority": "STP port priority (0-240, step 16)",
+    "link-type": "STP point-to-point link type",
+    "portfast": "STP edge port (portfast)",
+    "loop-protect": "Per-port loop protection enable",
+    "port-security": "Per-port learned-MAC count limit",
+    "maximum": "Maximum number of MAC addresses",
+    "broadcast": "Broadcast storm",
+    "unknown-unicast": "Unknown (flooded) unicast storm",
+    "unknown-multicast": "Unknown multicast storm",
+    "multicast": "Known multicast storm",
+    # qos / scheduler
+    "qos": "Quality of Service",
+    "wrr": "Weighted round-robin queue weight",
+    "queue": "Egress queue (1-8)",
+    "weight": "WRR weight (1-15) or 'strict'",
+    "scheduler": "Queue scheduling (WRR weights / strict)",
+    # global features
+    "jumbo-frame": "Maximum frame size (jumbo)",
+    "igmp": "IGMP snooping",
+    "snooping": "Enable snooping",
+    "loop-protect-global": "Global loop protocol mode",
+    "loopback-detection": "Global loop detection/prevention mode",
+    "mode": "Set mode / variant",
+    "energy-efficient-ethernet": "802.3az Energy Efficient Ethernet",
+    "eee": "802.3az Energy Efficient Ethernet",
+    "monitor": "Port mirroring (SPAN) session",
+    "session": "Mirroring session",
+    "source": "Mirror source port",
+    "destination": "Mirror destination port",
+    "trunk": "Trunk / link-aggregation",
+    # tools
+    "backup": "Download (back up) the running config blob",
+    "restore": "Upload (restore) a config blob (disruptive)",
+    "boot": "Firmware management",
+    "system": "Firmware upgrade (enters bootloader; disruptive)",
+    "reload": "Reboot the switch (disruptive)",
+    "erase": "Erase configuration",
+    "factory-reset": "Restore factory defaults (disruptive)",
+    "config": "Configuration file",
+    "table": "Table output",
 }
-ARG_HELP = {"vid": "<1-4094>  VLAN ID", "list": "<vlan-list>  e.g. 10,12,777", "text": "<line>"}
+ARG_HELP = {
+    "vid": "<1-4094>  VLAN ID", "list": "<vlan-list>  e.g. 10,12,777",
+    "text": "<line>", "addr": "<A.B.C.D>", "mask": "<A.B.C.D>  netmask",
+    "gw": "<A.B.C.D>  gateway", "user": "<name>", "pass": "<password>",
+    "n": "<integer>", "rate": "<kbps>", "mac": "<HH:HH:HH:HH:HH:HH>",
+    "id": "<group-id 1-2>", "cost": "<0-200000000, 0=auto>",
+    "prio": "<priority>", "size": "<bytes>", "file": "<path>",
+}
 
 
 class CLI:
@@ -598,6 +984,89 @@ class CLI:
             (("iface",), [_lit("no"), _lit("switchport"), _lit("trunk"), _lit("native"), _lit("vlan")], self._h_no_native, "reset native to VLAN 1"),
             (("iface",), [_lit("switchport"), _lit("trunk"), _lit("allowed"), _lit("vlan"), _kw("op", "add", "remove"), _rest("list", "<vlan-list>")], self._h_allowed, "edit trunk VLANs"),
             (("iface",), [_lit("switchport"), _lit("trunk"), _lit("allowed"), _lit("vlan"), _rest("list", "<vlan-list>")], self._h_allowed, "set trunk VLANs"),
+
+            # ---- new SHOW commands (all modes) ---------------------------- #
+            (ALL, [_lit("show"), _lit("ip")], lambda a: self.show_ip(), "management IP"),
+            (ALL, [_lit("show"), _lit("mac"), _lit("address-table")], lambda a: self.show_mac_table(), "MAC table"),
+            (ALL, [_lit("show"), _lit("mac"), _lit("address-table"), _lit("static")], lambda a: self.show_static_mac(), "static MACs"),
+            (ALL, [_lit("show"), _lit("spanning-tree")], lambda a: self.show_stp(), "STP status"),
+            (ALL, [_lit("show"), _lit("qos")], lambda a: self.show_qos(), "QoS settings"),
+            (ALL, [_lit("show"), _lit("storm-control")], lambda a: self.show_storm(), "storm control"),
+            (ALL, [_lit("show"), _lit("ip"), _lit("igmp"), _lit("snooping")], lambda a: self.show_igmp(), "IGMP snooping"),
+            (ALL, [_lit("show"), _lit("trunk")], lambda a: self.show_trunk(), "link aggregation"),
+            (ALL, [_lit("show"), _lit("monitor")], lambda a: self.show_mirror(), "port mirroring"),
+            (ALL, [_lit("show"), _lit("isolation")], lambda a: self.show_isolation(), "port isolation"),
+            (ALL, [_lit("show"), _lit("jumbo-frame")], lambda a: self.show_jumbo(), "jumbo frame size"),
+            (ALL, [_lit("show"), _lit("eee")], lambda a: self.show_eee(), "EEE state"),
+            (ALL, [_lit("show"), _lit("rate-limit")], lambda a: self.show_bw(), "bandwidth limits"),
+            (ALL, [_lit("show"), _lit("port-security")], lambda a: self.show_mac_constraint(), "MAC count limits"),
+
+            # ---- System: IP / username (DANGEROUS - dry-run/guarded) ------ #
+            (CFG, [_lit("ip"), _lit("address"), _arg("addr"), _arg("mask"), _arg("gw")], self._h_ip_address, "set mgmt IP (disruptive)"),
+            (CFG, [_lit("ip"), _lit("address"), _lit("dhcp")], self._h_ip_dhcp, "mgmt IP via DHCP (disruptive)"),
+            (CFG, [_lit("username"), _arg("user"), _lit("password"), _arg("pass")], self._h_username, "set admin user/pass (disruptive)"),
+
+            # ---- Global feature toggles ----------------------------------- #
+            (CFG, [_lit("jumbo-frame"), _kw("size", "1522", "1536", "1552", "9216", "16383")], self._h_jumbo, "set jumbo frame size"),
+            (CFG, [_lit("ip"), _lit("igmp"), _lit("snooping")], lambda a: self._h_igmp(True), "enable IGMP snooping"),
+            (CFG, [_lit("no"), _lit("ip"), _lit("igmp"), _lit("snooping")], lambda a: self._h_igmp(False), "disable IGMP snooping"),
+            (CFG, [_lit("energy-efficient-ethernet")], lambda a: self._h_eee(True), "enable EEE"),
+            (CFG, [_lit("no"), _lit("energy-efficient-ethernet")], lambda a: self._h_eee(False), "disable EEE"),
+            (CFG, [_lit("loopback-detection"), _kw("mode", "off", "detection", "prevention", "stp")], self._h_loop_mode, "global loop mode"),
+
+            # ---- QoS scheduler (global) ----------------------------------- #
+            (CFG, [_lit("qos"), _lit("scheduler"), _lit("strict"), _int("queue")], self._h_sched_strict, "queue strict priority"),
+            (CFG, [_lit("qos"), _lit("scheduler"), _lit("wrr"), _int("queue"), _int("weight")], self._h_sched_wrr, "queue WRR weight"),
+
+            # ---- Spanning tree (global) ----------------------------------- #
+            (CFG, [_lit("spanning-tree"), _lit("mode"), _kw("mode", "stp", "rstp")], self._h_stp_mode, "STP version"),
+            (CFG, [_lit("spanning-tree"), _lit("priority"), _int("prio")], self._h_stp_priority, "bridge priority (x4096)"),
+            (CFG, [_lit("spanning-tree"), _lit("max-age"), _int("n")], lambda a: self._h_stp_timer("maxage", a["n"]), "STP max-age"),
+            (CFG, [_lit("spanning-tree"), _lit("hello-time"), _int("n")], lambda a: self._h_stp_timer("hello", a["n"]), "STP hello time"),
+            (CFG, [_lit("spanning-tree"), _lit("forward-time"), _int("n")], lambda a: self._h_stp_timer("delay", a["n"]), "STP forward delay"),
+
+            # ---- Link aggregation (global) -------------------------------- #
+            (CFG, [_lit("trunk"), _int("id"), _kw("mode", "static", "lacp"), _iface("ports")], self._h_trunk, "create/modify trunk group"),
+            (CFG, [_lit("no"), _lit("trunk"), _int("id")], self._h_no_trunk, "delete trunk group"),
+
+            # ---- Port mirroring (global) ---------------------------------- #
+            (CFG, [_lit("monitor"), _lit("session"), _lit("source"), _arg("src"), _kw("dir", "rx", "tx", "both"), _lit("destination"), _arg("dst")], self._h_monitor, "mirror src->dst"),
+            (CFG, [_lit("no"), _lit("monitor"), _lit("session")], self._h_no_monitor, "delete mirror session"),
+
+            # ---- Static MAC / MAC table (global) -------------------------- #
+            (CFG, [_lit("mac"), _lit("address-table"), _lit("static"), _arg("mac"), _lit("vlan"), _int("vid"), _lit("interface"), _iface("if")], self._h_static_mac, "add static MAC"),
+            (CFG, [_lit("no"), _lit("mac"), _lit("address-table"), _lit("static"), _int("n")], self._h_no_static_mac, "delete static MAC by index"),
+            (ALL, [_lit("clear"), _lit("mac"), _lit("address-table"), _lit("dynamic")], self._h_clear_mac, "clear learned MACs"),
+
+            # ---- interface-mode: speed / duplex / flow / qos / stp / etc -- #
+            (("iface",), [_lit("speed"), _kw("speed", "auto", "10", "100", "1000", "2500", "10g")], self._h_speed, "port speed"),
+            (("iface",), [_lit("duplex"), _kw("duplex", "auto", "half", "full")], self._h_duplex, "port duplex"),
+            (("iface",), [_lit("flowcontrol"), _kw("state", "on", "off")], self._h_flow, "flow control"),
+            (("iface",), [_lit("qos"), _lit("priority"), _int("prio")], self._h_qos_priority, "default priority queue"),
+            (("iface",), [_lit("rate-limit"), _kw("dir", "ingress", "egress"), _int("rate")], self._h_rate_limit, "bandwidth limit (kbps)"),
+            (("iface",), [_lit("no"), _lit("rate-limit"), _kw("dir", "ingress", "egress")], self._h_no_rate_limit, "remove bandwidth limit"),
+            (("iface",), [_lit("storm-control"), _kw("kind", "broadcast", "multicast", "unknown-unicast", "unknown-multicast"), _lit("level"), _int("rate")], self._h_storm_on, "enable storm control"),
+            (("iface",), [_lit("no"), _lit("storm-control"), _kw("kind", "broadcast", "multicast", "unknown-unicast", "unknown-multicast")], self._h_storm_off, "disable storm control"),
+            (("iface",), [_lit("isolation"), _iface("peers")], self._h_isolation, "isolate from ports"),
+            (("iface",), [_lit("no"), _lit("isolation")], self._h_no_isolation, "clear isolation"),
+            (("iface",), [_lit("channel-group"), _int("id"), _kw("mode", "static", "lacp")], self._h_channel_group, "add to trunk group"),
+            (("iface",), [_lit("loop-protect")], lambda a: self._h_loop_port(True), "enable loop protect"),
+            (("iface",), [_lit("no"), _lit("loop-protect")], lambda a: self._h_loop_port(False), "disable loop protect"),
+            (("iface",), [_lit("port-security"), _lit("maximum"), _int("n")], self._h_port_security, "set MAC limit"),
+            (("iface",), [_lit("no"), _lit("port-security")], self._h_no_port_security, "disable MAC limit"),
+            (("iface",), [_lit("spanning-tree"), _lit("cost"), _int("cost")], self._h_stp_cost, "STP path cost"),
+            (("iface",), [_lit("spanning-tree"), _lit("port-priority"), _int("prio")], self._h_stp_pport, "STP port priority"),
+            (("iface",), [_lit("spanning-tree"), _lit("link-type"), _kw("p2p", "point-to-point", "shared", "auto")], self._h_stp_p2p, "STP link type"),
+            (("iface",), [_lit("spanning-tree"), _lit("portfast")], lambda a: self._h_stp_edge(True), "STP edge port"),
+            (("iface",), [_lit("no"), _lit("spanning-tree"), _lit("portfast")], lambda a: self._h_stp_edge(False), "clear STP edge"),
+
+            # ---- Tools (exec) --------------------------------------------- #
+            (("exec",), [_lit("copy"), _lit("running-config"), _lit("backup"), _rest("file", "<path>")], self._h_backup, "download config blob"),
+            (("exec",), [_lit("copy"), _lit("backup"), _lit("running-config"), _rest("file", "<path>")], self._h_restore, "restore config (disruptive)"),
+            (("exec",), [_lit("boot"), _lit("system")], self._h_firmware, "firmware upgrade (disruptive)"),
+            (("exec",), [_lit("reload")], self._h_reload, "reboot switch (disruptive)"),
+            (("exec",), [_lit("erase"), _lit("startup-config")], self._h_factory, "factory reset (disruptive)"),
+            (("exec",), [_lit("factory-reset")], self._h_factory, "factory reset (disruptive)"),
         ]
 
     # ---- show commands ---------------------------------------------------- #
@@ -638,6 +1107,23 @@ class CLI:
         ports = self.sw.fetch_ports()
         print(f"! running-config of {self.sw.name} ({self.sw.host})")
         print("!")
+        # Global settings (best-effort; ignore parse failures so config still prints).
+        try:
+            jumbo = self.sw.fetch_jumbo()
+            if jumbo not in ("?", "1522"):
+                print(f"jumbo-frame {jumbo}")
+            if self.sw.fetch_igmp()["enabled"]:
+                print("ip igmp snooping")
+            if self.sw.fetch_eee():
+                print("energy-efficient-ethernet")
+            print("!")
+        except Exception:
+            pass
+        pcfg = {}
+        try:
+            pcfg = self.sw.fetch_port_cfg()
+        except Exception:
+            pass
         for vid in sorted(vlans):
             if vid == 1:
                 continue
@@ -663,6 +1149,16 @@ class CLI:
             else:
                 print(" switchport mode access")
                 print(f" switchport access vlan {info.get('pvid','?')}")
+            pc = pcfg.get(p, {})
+            cs = (pc.get("cfg_speed") or "").lower()
+            if cs and not cs.startswith("auto"):
+                spk = {"10m/half": "10", "10m/full": "10", "100m/half": "100",
+                       "100m/full": "100", "1000m/full": "1000",
+                       "2500m/full": "2500", "10g/full": "10g"}.get(cs.replace(" ", ""))
+                if spk:
+                    print(f" speed {spk}")
+            if (pc.get("flow_cfg") or "").lower().startswith("on"):
+                print(" flowcontrol on")
             if info.get("state") == "Disable":
                 print(" shutdown")
             print("!")
@@ -1066,6 +1562,411 @@ class CLI:
             if p in v["untagged"]:
                 return vid
         return None
+
+    # ====================================================================== #
+    #  NEW show commands
+    # ====================================================================== #
+    def show_ip(self):
+        ip = self.sw.fetch_ip()
+        print(f"Management IP : {ip['ip']}")
+        print(f"Netmask       : {ip['netmask']}")
+        print(f"Gateway       : {ip['gateway']}")
+        print(f"DHCP client   : {'enabled' if ip['dhcp'] == '1' else 'disabled'}")
+
+    def show_mac_table(self):
+        t = self.sw.fetch_mac_table()
+        if not t["macs"]:
+            print("(no dynamic MAC entries — or table parsed empty)")
+        for ln in t["macs"]:
+            print(ln)
+
+    def show_static_mac(self):
+        for ln in self.sw.fetch_static_mac():
+            print(ln)
+
+    def show_stp(self):
+        d = self.sw.fetch_loop()
+        print("== Loop protocol =="); [print(" ", l) for l in d["loop"]]
+        print("== STP global ==");    [print(" ", l) for l in d["stp_global"]]
+        print("== STP port ==");      [print(" ", l) for l in d["stp_port"]]
+
+    def show_qos(self):
+        d = self.sw.fetch_qos()
+        print("== Port priority =="); [print(" ", l) for l in d["port_pri"]]
+        print("== Scheduler ==");     [print(" ", l) for l in d["sched"]]
+
+    def show_storm(self):
+        [print(l) for l in self.sw.fetch_storm()]
+
+    def show_igmp(self):
+        d = self.sw.fetch_igmp()
+        print(f"IGMP snooping: {'enabled' if d['enabled'] else 'disabled'}")
+        for l in d["lines"]:
+            print(" ", l)
+
+    def show_trunk(self):
+        [print(l) for l in self.sw.fetch_trunk()]
+
+    def show_mirror(self):
+        [print(l) for l in self.sw.fetch_mirror()]
+
+    def show_isolation(self):
+        [print(l) for l in self.sw.fetch_isolation()]
+
+    def show_jumbo(self):
+        print(f"Jumbo frame size: {self.sw.fetch_jumbo()} bytes")
+
+    def show_eee(self):
+        print(f"EEE: {'enabled' if self.sw.fetch_eee() else 'disabled'}")
+
+    def show_bw(self):
+        [print(l) for l in self.sw.fetch_bw()]
+
+    def show_mac_constraint(self):
+        [print(l) for l in self.sw.fetch_mac_constraint()]
+
+    # ====================================================================== #
+    #  NEW handlers — system
+    # ====================================================================== #
+    def _h_ip_address(self, a):
+        if not self.sw.dry_run and not _confirm(
+                f"Change management IP to {a['addr']}/{a['mask']} gw {a['gw']}? "
+                "You may lose connectivity."):
+            print("Aborted."); return
+        self.sw.set_ip(a["addr"], a["mask"], a["gw"], 0)
+        self.dirty = True
+
+    def _h_ip_dhcp(self, a):
+        if not self.sw.dry_run and not _confirm(
+                "Switch management IP to DHCP? You may lose connectivity."):
+            print("Aborted."); return
+        cur = self.sw.fetch_ip() if not self.sw.dry_run else {"ip": "0.0.0.0", "netmask": "0.0.0.0", "gateway": "0.0.0.0"}
+        self.sw.set_ip(cur["ip"], cur["netmask"], cur["gateway"], 1)
+        self.dirty = True
+
+    def _h_username(self, a):
+        if not self.sw.dry_run and not _confirm(
+                f"Change admin account to user '{a['user']}'?"):
+            print("Aborted."); return
+        self.sw.set_user(a["user"], a["pass"])
+        self.dirty = True
+
+    # ---- global features -------------------------------------------------- #
+    def _h_jumbo(self, a):
+        self.sw.set_jumbo(JUMBO_CODES[a["size"]])
+        self.dirty = True
+
+    def _h_igmp(self, enable):
+        self.sw.set_igmp(enable)
+        self.dirty = True
+
+    def _h_eee(self, enable):
+        self.sw.set_eee(enable)
+        self.dirty = True
+
+    def _h_loop_mode(self, a):
+        code = {"off": 0, "detection": 1, "prevention": 2, "stp": 3}[a["mode"]]
+        self.sw.set_loop(code)
+        self.dirty = True
+
+    # ---- QoS scheduler ---------------------------------------------------- #
+    def _h_sched_strict(self, a):
+        q = a["queue"]
+        if not 1 <= q <= 8:
+            raise CmdError("% queue must be 1-8")
+        self.sw.set_queue_weight([q], 0)
+        self.dirty = True
+
+    def _h_sched_wrr(self, a):
+        q, w = a["queue"], a["weight"]
+        if not 1 <= q <= 8:
+            raise CmdError("% queue must be 1-8")
+        if not 1 <= w <= 15:
+            raise CmdError("% weight must be 1-15 (use 'strict' for strict priority)")
+        self.sw.set_queue_weight([q], w)
+        self.dirty = True
+
+    # ---- STP global ------------------------------------------------------- #
+    def _stp_globals(self):
+        """Parse current STP global values to preserve untouched fields."""
+        html = self.sw._get("/loop.cgi?page=stp_global")
+        def field(name, default):
+            m = re.search(rf'name="{name}"[^>]*value="(\d+)"', html)
+            return int(m.group(1)) if m else default
+        ver = 1 if re.search(r'name="version".*?value="1"[^>]*selected', html, re.S) else 0
+        pm = re.search(r'name="priority".*?value="(\d+)"[^>]*selected', html, re.S)
+        prio = int(pm.group(1)) if pm else 32768
+        return {"version": ver, "priority": prio,
+                "maxage": field("maxage", 20), "hello": field("hello", 2),
+                "delay": field("delay", 15)}
+
+    def _push_stp_global(self, **over):
+        g = ({"version": 1, "priority": 32768, "maxage": 20, "hello": 2, "delay": 15}
+             if self.sw.dry_run else self._stp_globals())
+        g.update(over)
+        self.sw.set_stp_global(g["version"], g["priority"], g["maxage"], g["hello"], g["delay"])
+        self.dirty = True
+
+    def _h_stp_mode(self, a):
+        self._push_stp_global(version=1 if a["mode"] == "rstp" else 0)
+
+    def _h_stp_priority(self, a):
+        if a["prio"] % 4096 != 0 or not 0 <= a["prio"] <= 61440:
+            raise CmdError("% priority must be a multiple of 4096 (0-61440)")
+        self._push_stp_global(priority=a["prio"])
+
+    def _h_stp_timer(self, which, val):
+        self._push_stp_global(**{which: val})
+
+    # ---- link aggregation ------------------------------------------------- #
+    def _h_trunk(self, a):
+        try:
+            ports = parse_ifrange(a["ports"])
+        except ValueError as e:
+            raise CmdError(f"% {e}")
+        if not 1 <= a["id"] <= 2:
+            raise CmdError("% trunk id must be 1 or 2")
+        self.sw.set_trunk(a["id"], 1 if a["mode"] == "lacp" else 0, ports)
+        self.dirty = True
+
+    def _h_no_trunk(self, a):
+        self.sw.delete_trunk(a["id"])
+        self.dirty = True
+
+    def _h_channel_group(self, a):
+        if not 1 <= a["id"] <= 2:
+            raise CmdError("% trunk id must be 1 or 2")
+        self.sw.set_trunk(a["id"], 1 if a["mode"] == "lacp" else 0, self.ctx["ports"])
+        self.dirty = True
+
+    # ---- mirroring -------------------------------------------------------- #
+    def _h_monitor(self, a):
+        try:
+            src = parse_ifrange(a["src"])
+            dst = parse_ifrange(a["dst"])
+        except ValueError as e:
+            raise CmdError(f"% {e}")
+        if len(dst) != 1:
+            raise CmdError("% destination must be a single port")
+        for sp in src:
+            self.sw.set_mirror(MIRROR_DIR[a["dir"]], dst[0], sp)
+        self.dirty = True
+
+    def _h_no_monitor(self, a):
+        self.sw.delete_mirror()
+        self.dirty = True
+
+    # ---- static MAC ------------------------------------------------------- #
+    def _h_static_mac(self, a):
+        try:
+            ports = parse_ifrange(a["if"])
+        except ValueError as e:
+            raise CmdError(f"% {e}")
+        if len(ports) != 1:
+            raise CmdError("% static MAC needs exactly one interface")
+        self.sw.add_static_mac(a["mac"], a["vid"], ports[0])
+        self.dirty = True
+
+    def _h_no_static_mac(self, a):
+        self.sw.delete_static_mac(a["n"])
+        self.dirty = True
+
+    def _h_clear_mac(self, a):
+        self.sw.clear_mac_table()
+        print("Dynamic MAC entries cleared.")
+
+    # ====================================================================== #
+    #  NEW handlers — interface mode
+    # ====================================================================== #
+    def _port_state(self, p):
+        """Current admin (bool enabled), speed code, flow (0/1) for a port."""
+        cfg = ({} if self.sw.dry_run else self.sw.fetch_port_cfg().get(p, {}))
+        state = cfg.get("state", "Enable")
+        enabled = not state.lower().startswith("dis")
+        sp = SPEED_CODES.get(re.sub(r"[^0-9gG]", "", cfg.get("cfg_speed", "auto")).lower(), 0)
+        if cfg.get("cfg_speed", "").lower().startswith("auto"):
+            sp = 0
+        flow = 1 if cfg.get("flow_cfg", "Off").lower().startswith("on") else 0
+        return enabled, sp, flow
+
+    def _h_speed(self, a):
+        code = {"auto": 0, "10": 2, "100": 4, "1000": 5, "2500": 6, "10g": 8}[a["speed"]]
+        for p in self.ctx["ports"]:
+            if p >= 5 and code in (1, 2, 3):
+                raise CmdError(f"% 10G port {port_short(p)} does not support {a['speed']}M")
+            en, _sp, fl = self._port_state(p)
+            self.sw.set_port_cfg(p, en, code, fl)
+        self.dirty = True
+
+    def _h_duplex(self, a):
+        # Combine with current rate: only 10/100 have half; 'full'/'auto' map within capability.
+        for p in self.ctx["ports"]:
+            en, sp, fl = self._port_state(p)
+            d = a["duplex"]
+            if d == "auto":
+                code = 0
+            else:
+                # derive rate from current code
+                rate = {1: "10", 2: "10", 3: "100", 4: "100", 5: "1000",
+                        6: "2500", 8: "10g", 0: "auto"}.get(sp, "auto")
+                if rate in ("1000", "2500", "10g") and d == "half":
+                    raise CmdError(f"% {rate} does not support half duplex")
+                code = {("10", "half"): 1, ("10", "full"): 2,
+                        ("100", "half"): 3, ("100", "full"): 4,
+                        ("1000", "full"): 5, ("2500", "full"): 6,
+                        ("10g", "full"): 8, ("auto", "full"): 0,
+                        ("auto", "half"): 0}[(rate, d)]
+            self.sw.set_port_cfg(p, en, code, fl)
+        self.dirty = True
+
+    def _h_flow(self, a):
+        fl = 1 if a["state"] == "on" else 0
+        for p in self.ctx["ports"]:
+            en, sp, _f = self._port_state(p)
+            self.sw.set_port_cfg(p, en, sp, fl)
+        self.dirty = True
+
+    def _h_qos_priority(self, a):
+        if not 1 <= a["prio"] <= 8:
+            raise CmdError("% priority must be 1-8")
+        self.sw.set_port_priority(self.ctx["ports"], a["prio"] - 1)
+        self.dirty = True
+
+    def _h_rate_limit(self, a):
+        d = 0 if a["dir"] == "ingress" else 1
+        self.sw.set_bw(self.ctx["ports"], d, 1, a["rate"])
+        self.dirty = True
+
+    def _h_no_rate_limit(self, a):
+        d = 0 if a["dir"] == "ingress" else 1
+        self.sw.set_bw(self.ctx["ports"], d, 0, 0)
+        self.dirty = True
+
+    def _h_storm_on(self, a):
+        self.sw.set_storm(STORM_CODES[a["kind"]], self.ctx["ports"], 1, a["rate"])
+        self.dirty = True
+
+    def _h_storm_off(self, a):
+        self.sw.set_storm(STORM_CODES[a["kind"]], self.ctx["ports"], 0, 0)
+        self.dirty = True
+
+    def _h_isolation(self, a):
+        try:
+            peers = parse_ifrange(a["peers"])
+        except ValueError as e:
+            raise CmdError(f"% {e}")
+        self.sw.set_isolation(self.ctx["ports"], peers)
+        self.dirty = True
+
+    def _h_no_isolation(self, a):
+        self.sw.set_isolation(self.ctx["ports"], set())
+        self.dirty = True
+
+    def _h_loop_port(self, enable):
+        self.sw.set_loop_port(self.ctx["ports"], enable)
+        self.dirty = True
+
+    def _h_port_security(self, a):
+        self.sw.set_mac_constraint(self.ctx["ports"], 1, a["n"])
+        self.dirty = True
+
+    def _h_no_port_security(self, a):
+        self.sw.set_mac_constraint(self.ctx["ports"], 0, 0)
+        self.dirty = True
+
+    def _stp_port_state(self, ports):
+        """Best-effort current (cost, priority, p2p, edge) for the first port,
+        so editing one attribute preserves the others. Defaults on dry-run / parse miss."""
+        cost, prio, p2p, edge = 0, 128, "auto", "false"
+        if self.sw.dry_run:
+            return cost, prio, p2p, edge
+        # The stp_port status table prints per-port: Port|State|Role|CostCfg|CostAct|Prio|...
+        cells = [c.strip() for c in re.sub(r"\s+", " ",
+                 re.sub(r"<[^>]+>", "|", self.sw._get("/loop.cgi?page=stp_port"))).split("|")
+                 if c.strip()]
+        p0 = sorted(ports)[0]
+        for i, c in enumerate(cells):
+            m = re.fullmatch(r"Port (\d+)", c)
+            if m and int(m.group(1)) == p0 and i + 9 < len(cells):
+                try:
+                    cost = int(cells[i + 3])
+                except ValueError:
+                    cost = 0
+                try:
+                    prio = int(cells[i + 5])
+                except (ValueError, IndexError):
+                    prio = 128
+                break
+        return cost, prio, p2p, edge
+
+    def _h_stp_cost(self, a):
+        for p in self.ctx["ports"]:
+            _c, prio, p2p, edge = self._stp_port_state([p])
+            self.sw.set_stp_port([p], a["cost"], prio, p2p, edge)
+        self.dirty = True
+
+    def _h_stp_pport(self, a):
+        if a["prio"] % 16 != 0 or not 0 <= a["prio"] <= 240:
+            raise CmdError("% port-priority must be a multiple of 16 (0-240)")
+        for p in self.ctx["ports"]:
+            cost, _pr, p2p, edge = self._stp_port_state([p])
+            self.sw.set_stp_port([p], cost, a["prio"], p2p, edge)
+        self.dirty = True
+
+    def _h_stp_p2p(self, a):
+        p2p = {"point-to-point": "true", "shared": "false", "auto": "auto"}[a["p2p"]]
+        for p in self.ctx["ports"]:
+            cost, prio, _p, edge = self._stp_port_state([p])
+            self.sw.set_stp_port([p], cost, prio, p2p, edge)
+        self.dirty = True
+
+    def _h_stp_edge(self, enable):
+        for p in self.ctx["ports"]:
+            cost, prio, p2p, _e = self._stp_port_state([p])
+            self.sw.set_stp_port([p], cost, prio, p2p, "true" if enable else "false")
+        self.dirty = True
+
+    # ====================================================================== #
+    #  NEW handlers — tools (DANGEROUS gated)
+    # ====================================================================== #
+    def _h_backup(self, a):
+        path = a["file"].strip()
+        if self.sw.dry_run:
+            print(f"  DRY-RUN GET /config_back.cgi?cmd=conf_backup -> {path}")
+            return
+        n = self.sw.backup_config(path)
+        print(f"Wrote {n} bytes to {path}")
+
+    def _h_restore(self, a):
+        path = a["file"].strip()
+        if not os.path.exists(path) and not self.sw.dry_run:
+            raise CmdError(f"% file not found: {path}")
+        if not self.sw.dry_run and not _confirm(
+                f"Restore config from {path}? The switch will apply it and may reboot."):
+            print("Aborted."); return
+        self.sw.restore_config(path)
+        print("Config restore submitted.")
+
+    def _h_firmware(self, a):
+        if not self.sw.dry_run and not _confirm(
+                "Enter firmware-upgrade (bootloader) mode? This is DISRUPTIVE and the "
+                "switch will go offline awaiting a firmware image."):
+            print("Aborted."); return
+        self.sw.firmware_upgrade()
+        print("Firmware upgrade mode entered.")
+
+    def _h_reload(self, a):
+        if not self.sw.dry_run and not _confirm("Reboot the switch now?"):
+            print("Aborted."); return
+        self.sw.reboot()
+        print("Reboot requested.")
+
+    def _h_factory(self, a):
+        if not self.sw.dry_run and not _confirm(
+                "FACTORY RESET — erase ALL configuration and restore defaults?"):
+            print("Aborted."); return
+        self.sw.factory_reset()
+        print("Factory reset requested.")
 
 
 # --------------------------------------------------------------------------- #
