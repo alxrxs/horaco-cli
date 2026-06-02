@@ -1,0 +1,14 @@
+# horaco-cli inventory — copy this to one of:
+#   switches.yml            (plaintext; keep it out of git)
+#   switches.sops.yaml      (SOPS-encrypted; safe to commit)
+# placed NEXT TO this tool, in its PARENT directory, or pointed to by
+# the $HORACO_SWITCHES environment variable.
+#
+# Auth: the ZX-SWTG124AS web UI uses cookie admin=md5(user+password);
+# horaco.py computes that for you, so just give the real username/password.
+switches:
+  myswitch:
+    host: 192.168.1.10
+    user: admin
+    password: changeme
+    ports: 6        # number of physical ports (default 6)

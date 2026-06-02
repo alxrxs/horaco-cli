@@ -1,0 +1,7 @@
+# Never commit real inventory / credentials or local state to the public repo.
+switches.yml
+switches.yaml
+switches.sops.yaml
+descriptions.yml
+__pycache__/
+*.pyc
