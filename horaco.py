@@ -2096,13 +2096,13 @@ def read_line(cli, prompt_str):
 
     def show_help():
         completed, partial = cli._split_partial(buf[:cur])
-        out.write("?\n")
+        out.write("?\r\n")
         rows = cli.help_rows(completed, partial) if completed is not None else []
         if rows:
             for tok, desc in rows:
-                out.write(f"  {tok:<28}{desc}\n")
+                out.write(f"  {tok:<28}{desc}\r\n")
         else:
-            out.write("  % No matching options\n")
+            out.write("  % No matching options\r\n")
         redraw()
 
     def do_tab():
@@ -2121,7 +2121,7 @@ def read_line(cli, prompt_str):
             common = os.path.commonprefix(cands)
             ins = common if len(common) > len(raw) else None
             if ins is None:  # ambiguous — list candidates IOS-style, keep the line
-                out.write("\n  " + "  ".join(cands) + "\n")
+                out.write("\r\n  " + "  ".join(cands) + "\r\n")
                 redraw()
                 return
         buf = buf[:start] + ins + buf[cur:]
