@@ -1505,8 +1505,27 @@ class CLI:
             print("!")
 
     def show_version(self):
-        for line in self.sw.version():
-            print(line)
+        # info.cgi flattens to: [<section headers>], then alternating label / value
+        # pairs (Device Model / ZX-..., MAC Address / 1C:..., etc). Known labels let
+        # us pair them into an IOS-ish "Label : value" block and drop the headers.
+        lines = self.sw.version()
+        labels = ("Device Model", "MAC Address", "IP Address", "Netmask",
+                  "Gateway", "Firmware Version", "Firmware Date", "Hardware Version",
+                  "Loader Version", "Serial Number")
+        pairs, i = [], 0
+        while i < len(lines):
+            if lines[i] in labels and i + 1 < len(lines):
+                pairs.append((lines[i], lines[i + 1]))
+                i += 2
+            else:
+                i += 1
+        if not pairs:  # parser missed the format — fall back to the raw dump
+            for line in lines:
+                print(line)
+            return
+        width = max(len(k) for k, _ in pairs)
+        for k, v in pairs:
+            print(f"{k:<{width}} : {v}")
 
     # ---- config helpers --------------------------------------------------- #
     def _apply_port_membership(self, ports, untagged_vid, tagged_vids, accept, set_pvid=True):
@@ -1558,8 +1577,13 @@ class CLI:
         except ValueError as e:
             print(f"% parse error: {e}")
             return
+        # IOS 'do <exec-cmd>': run an EXEC/show command from any config sub-mode.
+        eff_mode = self.mode
+        if len(toks) > 1 and self.mode != "exec" and toks[0].lower() == "do":
+            toks = toks[1:]
+            eff_mode = "exec"
         try:
-            handler, args = self._resolve(toks)
+            handler, args = self._resolve(toks, eff_mode)
         except CmdError as e:
             print(str(e))
             return
@@ -1627,10 +1651,50 @@ class CLI:
             return ("fail", None, None, None)  # leftover tokens
         return ("full", args, None, (lits, kws, -frees))
 
-    def _resolve(self, tokens):
+    def _ambiguous_literal(self, tokens, mode):
+        """IOS-style ambiguity check on literal abbreviations.
+
+        Walk token positions; at each, gather the distinct literal spec-values that the
+        token prefixes across all in-mode patterns still alive on the preceding tokens.
+        If a token is an *abbreviation* (not an exact literal) that matches more than one
+        distinct literal, it's ambiguous — even if exactly one branch later completes.
+        This stops e.g. 'sh' silently resolving to 'shutdown' when 'show' also exists.
+        Returns the conflicting literal set (sorted) or None.
+        """
+        # patterns alive after matching tokens[:i]
+        alive = [p for (modes, p, _h, _hl) in self.cmds if mode in modes]
+        for i, tok in enumerate(tokens):
+            tl = tok.lower()
+            here, survivors = set(), []
+            for pat in alive:
+                if i >= len(pat):
+                    continue
+                spec = pat[i]
+                if spec[0] == "lit":
+                    if spec[1] == tl:           # exact literal match
+                        survivors.append(pat)
+                    elif spec[1].startswith(tl):  # abbreviation
+                        here.add(spec[1])
+                        survivors.append(pat)
+                else:
+                    # non-literal (kw/int/arg/iface/rest) — token consumed, pattern survives
+                    survivors.append(pat)
+            # If any pattern matched this token exactly as a literal, IOS takes it and
+            # ambiguity among abbreviated siblings is irrelevant.
+            exact = any(i < len(p) and p[i][0] == "lit" and p[i][1] == tl for p in alive)
+            if not exact and here and len(here) > 1:
+                return sorted(here)
+            alive = survivors
+        return None
+
+    def _resolve(self, tokens, mode=None):
+        mode = mode or self.mode
+        amb = self._ambiguous_literal(tokens, mode)
+        if amb:
+            raise CmdError("% Ambiguous command, matches: " + ", ".join(amb))
         fulls, has_partial = [], False
         for modes, pattern, handler, _help in self.cmds:
-            if self.mode not in modes:
+            if mode not in modes:
                 continue
             st, args, _nxt, score = self._try(pattern, tokens)
             if st == "full":
@@ -1641,17 +1705,18 @@ class CLI:
             fulls.sort(key=lambda x: x[0], reverse=True)
             tied = [f for f in fulls if f[0] == fulls[0][0]]
             if len(tied) > 1:
-                raise CmdError("% Ambiguous command — matches: " + ", ".join(self._sig(f[3]) for f in tied))
+                raise CmdError("% Ambiguous command, matches: " + ", ".join(self._sig(f[3]) for f in tied))
             return fulls[0][1], fulls[0][2]
         if has_partial:
-            raise CmdError("% Incomplete command (type '?' to see options)")
-        raise CmdError(f"% Unrecognized command: {' '.join(tokens)}")
+            raise CmdError("% Incomplete command.")
+        raise CmdError(f"% Invalid input: {' '.join(tokens)}")
 
-    def _next(self, completed):
+    def _next(self, completed, mode=None):
         """Specs expected at the cursor after `completed` tokens, plus a <cr> flag."""
+        mode = mode or self.mode
         specs, seen, cr = [], set(), False
         for modes, pattern, handler, _help in self.cmds:
-            if self.mode not in modes:
+            if mode not in modes:
                 continue
             st, _a, nxt, _s = self._try(pattern, completed)
             if st == "partial" and nxt is not None:
@@ -1680,16 +1745,24 @@ class CLI:
             for spec in pattern
         )
 
-    def _token_help(self, completed, token):
+    def _do_split(self, completed):
+        """If in a config sub-mode and the first completed word is 'do', strip it and
+        report exec mode for help/completion. Returns (tokens, effective_mode)."""
+        if completed and self.mode != "exec" and completed[0].lower() == "do":
+            return completed[1:], "exec"
+        return completed, self.mode
+
+    def _token_help(self, completed, token, mode=None):
         """Help text for a literal `token` offered after `completed`.
 
         Uses the contributing command's own help when the token effectively names one
         command (so 'vlan' reads 'VLAN table' under 'show' but 'create/enter a VLAN' at
         config level); falls back to the generic table when the token branches.
         """
+        mode = mode or self.mode
         contribs = []
         for modes, pattern, _handler, chelp in self.cmds:
-            if self.mode not in modes:
+            if mode not in modes:
                 continue
             st, _a, nxt, _s = self._try(pattern, completed)
             if st == "partial" and nxt is not None and nxt[0] == "lit" and nxt[1] == token:
@@ -1704,12 +1777,16 @@ class CLI:
 
     def help_rows(self, completed, partial):
         """(token, description) rows valid at the cursor — for the '?' display."""
-        specs, cr = self._next(completed)
+        completed, mode = self._do_split(completed)
+        specs, cr = self._next(completed, mode)
         rows = []
+        # Offer 'do' itself at the start of a line in any config sub-mode.
+        if not completed and mode != "exec" and "do".startswith(partial):
+            rows.append(("do", "Run an exec-level command from config mode"))
         for spec in specs:
             kind = spec[0]
             if kind == "lit" and spec[1].startswith(partial):
-                rows.append((spec[1], self._token_help(completed, spec[1])))
+                rows.append((spec[1], self._token_help(completed, spec[1], mode)))
             elif kind == "kw":
                 kwhelp = spec[3] if len(spec) > 3 else {}
                 rows += [(c, kwhelp.get(c) or HELP.get(c, ""))
@@ -1730,8 +1807,11 @@ class CLI:
 
     def completions(self, completed, partial):
         """Sorted candidate strings for Tab completion of the current word."""
-        specs, _cr = self._next(completed)
+        completed, mode = self._do_split(completed)
+        specs, _cr = self._next(completed, mode)
         cands = []
+        if not completed and mode != "exec":
+            cands.append("do")
         for spec in specs:
             if spec[0] == "lit":
                 cands.append(spec[1])
