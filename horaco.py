@@ -403,14 +403,6 @@ class Switch:
         txt = re.sub(r"<[^>]*>", "", self._get("/info.cgi"))
         return [l.strip() for l in txt.splitlines() if l.strip()]
 
-    # -- generic page text scrape helper ----------------------------------- #
-    def _text_lines(self, path):
-        html = self._get(path)
-        html = re.sub(r"<script\b.*?</script>", "", html, flags=re.S | re.I)
-        html = re.sub(r"<style\b.*?</style>", "", html, flags=re.S | re.I)
-        txt = re.sub(r"<[^>]*>", "\n", html)
-        return [l.strip() for l in txt.splitlines() if l.strip()]
-
     # ===================================================================== #
     #  System: IP / user / port speed-duplex-flow
     # ===================================================================== #
@@ -485,8 +477,31 @@ class Switch:
         self._post("/qos.cgi?page=que_weight", data)
 
     def fetch_qos(self):
-        return {"port_pri": self._text_lines("/qos.cgi?page=port_pri"),
-                "sched": self._text_lines("/qos.cgi?page=pkt_sch")}
+        """Return {'port_pri':{port->queue}, 'sched':[{queue,weight}]}.
+
+        port_pri page: read-only table  Port N | Queue(1-8).
+        pkt_sch  page: read-only table  Queue(1-8) | Weight ('Strict priority'|1-15).
+        """
+        pp_html = self._get("/qos.cgi?page=port_pri")
+        port_pri = {}
+        # The config form's first table also has Port|Queue but its data row is a
+        # <select> (empty cells); the read-only rows have a literal "Port N".
+        for tbl in self._tables(pp_html):
+            hdr = " ".join(tbl["header"]).lower()
+            if "port" in hdr and "queue" in hdr:
+                for r in tbl["rows"]:
+                    m = re.fullmatch(r"Port (\d+)", r[0]) if r else None
+                    if m and len(r) >= 2 and r[1].isdigit():
+                        port_pri[int(m.group(1))] = r[1]
+        sched = []
+        sch_html = self._get("/qos.cgi?page=pkt_sch")
+        for tbl in self._tables(sch_html):
+            hdr = " ".join(tbl["header"]).lower()
+            if "queue" in hdr and "weight" in hdr:
+                for r in tbl["rows"]:
+                    if len(r) >= 2 and r[0].isdigit():
+                        sched.append({"queue": r[0], "weight": r[1]})
+        return {"port_pri": port_pri, "sched": sched}
 
     # ===================================================================== #
     #  Loop protection / STP
@@ -529,6 +544,45 @@ class Switch:
         for m in re.finditer(rf"<(?:{tags})\b[^>]*>(.*?)</(?:{tags})>", html, re.S | re.I):
             out.append(re.sub(r"<[^>]+>", "", m.group(1)).strip())
         return out
+
+    @staticmethod
+    def _tables(html):
+        """Return [ {'header': [th...], 'rows': [[td...], ...]} ] for every <table>.
+
+        Strips <script>/<style>. The first <tr> that contains <th> is the header;
+        all later <tr> are data rows. This lets a parser pick the read-only data
+        table by header signature and skip the config-form tables whose data cells
+        are <select>/<input> (which collapse to "").
+        """
+        html = re.sub(r"<script\b.*?</script>", "", html, flags=re.S | re.I)
+        html = re.sub(r"<style\b.*?</style>", "", html, flags=re.S | re.I)
+        html = html.replace("&nbsp;", " ")
+
+        def cells(tr, tag):
+            out = []
+            for m in re.finditer(rf"<{tag}\b[^>]*>(.*?)</{tag}>", tr, re.S | re.I):
+                out.append(re.sub(r"<[^>]+>", "", m.group(1)).strip())
+            return out
+
+        tables = []
+        for tm in re.finditer(r"<table\b[^>]*>(.*?)</table>", html, re.S | re.I):
+            body, header, rows = tm.group(1), [], []
+            for rm in re.finditer(r"<tr\b[^>]*>(.*?)</tr>", body, re.S | re.I):
+                tr = rm.group(1)
+                if re.search(r"<th\b", tr, re.I) and not header:
+                    header = cells(tr, "th")
+                else:
+                    rows.append(cells(tr, "td"))
+            tables.append({"header": header, "rows": [r for r in rows if r]})
+        return tables
+
+    def _find_table(self, html, *header_subs):
+        """First table whose joined header cells contain all given substrings."""
+        for t in self._tables(html):
+            hdr = " ".join(t["header"]).lower()
+            if all(s.lower() in hdr for s in header_subs):
+                return t
+        return None
 
     @staticmethod
     def _selected_option(html, name):
@@ -646,9 +700,19 @@ class Switch:
         self._post("/igmp.cgi?page=enable_igmp", data)
 
     def fetch_igmp(self):
+        """Return {'enabled':bool, 'groups':[{ip,port,vlan}]}.
+
+        Dump table header: IP Address | Port | VLAN ID. Empty when no groups learned.
+        """
         html = self._get("/igmp.cgi?page=dump")
         on = bool(re.search(r'name="enable_igmp"[^>]*checked', html))
-        return {"enabled": on, "lines": self._text_lines("/igmp.cgi?page=dump")}
+        groups = []
+        t = self._find_table(html, "IP Address", "VLAN")
+        if t:
+            for r in t["rows"]:
+                if len(r) >= 3:
+                    groups.append({"ip": r[0], "port": r[1], "vlan": r[2]})
+        return {"enabled": on, "groups": groups}
 
     # ===================================================================== #
     #  Link aggregation (trunk)
@@ -665,7 +729,22 @@ class Switch:
                    {f"remove_{group_id}": "on", "cmd": "group_remove"})
 
     def fetch_trunk(self):
-        return self._text_lines("/trunk.cgi?page=group")
+        """Return [{group,type,members,aggregated}] of configured LAG groups.
+
+        Remove-form table header: Group ID | Type | Member port | Aggregated Port |
+        Select. Empty (header only) when no groups are configured.
+        """
+        html = self._get("/trunk.cgi?page=group")
+        out = []
+        t = self._find_table(html, "Group ID", "Member port")
+        if t:
+            for r in t["rows"]:
+                if len(r) >= 3 and r[0]:
+                    out.append({
+                        "group": r[0], "type": r[1],
+                        "members": r[2], "aggregated": r[3] if len(r) > 3 else "",
+                    })
+        return out
 
     # ===================================================================== #
     #  Port mirroring / isolation / bandwidth
@@ -697,13 +776,64 @@ class Switch:
         self._post("/port.cgi?page=bwctrl", data)
 
     def fetch_mirror(self):
-        return self._text_lines("/port.cgi?page=mirroring")
+        """Return {'enabled':bool,'direction','dest','sources'} of the SPAN session.
+
+        The delete-form table shows one status row: Direction | Mirroring Port |
+        Mirrored Port List. When no session: 'Disable | - | -'.
+        """
+        html = self._get("/port.cgi?page=mirroring")
+        # Two tables share the "Mirror Direction" header: the config form (its cells
+        # are <select>s that collapse to multiline option text) and the delete form
+        # whose single row is the live status. Pick the row whose cells are all
+        # single-line scalars (skips the config form's multiline <select> text).
+        result = {"enabled": False, "direction": "Disable", "dest": "-", "sources": "-"}
+        for tbl in self._tables(html):
+            hdr = " ".join(tbl["header"]).lower()
+            if "mirror direction" not in hdr or not tbl["rows"]:
+                continue
+            r = tbl["rows"][0]
+            if len(r) >= 3 and not any("\n" in c for c in r[:3]):
+                direction = r[0].strip()
+                result = {
+                    "enabled": direction.lower() not in ("disable", "-", ""),
+                    "direction": direction, "dest": r[1].strip(),
+                    "sources": r[2].strip(),
+                }
+        return result
 
     def fetch_isolation(self):
-        return self._text_lines("/port.cgi?page=isolation")
+        """Return {port -> isolation-list-string} from the read-only table.
+
+        Table: Port N | Port Isolation List (e.g. '1-6'). The default '1-6' means
+        the port may forward to all ports (no isolation).
+        """
+        html = self._get("/port.cgi?page=isolation")
+        out = {}
+        for tbl in self._tables(html):
+            hdr = " ".join(tbl["header"]).lower()
+            if "port isolation list" in hdr:
+                for r in tbl["rows"]:
+                    m = re.fullmatch(r"Port (\d+)", r[0]) if r else None
+                    if m and len(r) >= 2:
+                        out[int(m.group(1))] = r[1].strip()
+        return out
 
     def fetch_bw(self):
-        return self._text_lines("/port.cgi?page=bw_ctrl")
+        """Return {port -> {'ingress','egress'}} of rate limits ('Unlimited' or kbps).
+
+        Read-only table: Port N | Ingress Rate | Egress Rate.
+        """
+        html = self._get("/port.cgi?page=bw_ctrl")
+        out = {}
+        for tbl in self._tables(html):
+            hdr = " ".join(tbl["header"]).lower()
+            if "ingress rate" in hdr and "egress rate" in hdr:
+                for r in tbl["rows"]:
+                    m = re.fullmatch(r"Port (\d+)", r[0]) if r else None
+                    if m and len(r) >= 3:
+                        out[int(m.group(1))] = {"ingress": r[1].strip(),
+                                                "egress": r[2].strip()}
+        return out
 
     # ===================================================================== #
     #  Forwarding: jumbo frame / storm control
@@ -726,7 +856,23 @@ class Switch:
         self._post("/fwd.cgi?page=storm_ctrl", data)
 
     def fetch_storm(self):
-        return self._text_lines("/fwd.cgi?page=storm_ctrl")
+        """Return {port -> {'broadcast','known_mcast','unknown_ucast','unknown_mcast'}}.
+
+        Read-only table columns: Port N | Broadcast | Known Multicast |
+        Unknown Unicast | Unknown Multicast. Each cell is 'Off' or a rate (kbps).
+        """
+        html = self._get("/fwd.cgi?page=storm_ctrl")
+        out = {}
+        t = self._find_table(html, "Broadcast", "Unknown Unicast")
+        if t:
+            for r in t["rows"]:
+                m = re.fullmatch(r"Port (\d+)", r[0]) if r else None
+                if m and len(r) >= 5:
+                    out[int(m.group(1))] = {
+                        "broadcast": r[1], "known_mcast": r[2],
+                        "unknown_ucast": r[3], "unknown_mcast": r[4],
+                    }
+        return out
 
     # ===================================================================== #
     #  MAC address table / static MAC / port security
@@ -763,7 +909,27 @@ class Switch:
                    {f"remove_{idx}": "on", "cmd": "macstatictbl"})
 
     def fetch_static_mac(self):
-        return self._text_lines("/mac.cgi?page=static")
+        """Return [{index,mac,vlan,port}] from the delete-form table.
+
+        Header: No. | MAC Address | VLAN ID | Port | Select. Empty when none.
+        """
+        html = self._get("/mac.cgi?page=static")
+        out = []
+        mac_re = re.compile(r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}")
+        t = self._find_table(html, "No.", "MAC Address", "VLAN")
+        if t:
+            for r in t["rows"]:
+                # find the MAC cell; index precedes it, vlan/port follow
+                for i, c in enumerate(r):
+                    if mac_re.fullmatch(c):
+                        out.append({
+                            "index": r[i - 1] if i else "",
+                            "mac": c,
+                            "vlan": r[i + 1] if i + 1 < len(r) else "",
+                            "port": r[i + 2] if i + 2 < len(r) else "",
+                        })
+                        break
+        return out
 
     def set_mac_constraint(self, ports, state, limit):
         """Per-port MAC count limit (port security). state 0/1, limit int."""
@@ -772,7 +938,20 @@ class Switch:
         self._post("/mac_constraint.cgi", data)
 
     def fetch_mac_constraint(self):
-        return self._text_lines("/mac_constraint.cgi")
+        """Return {port -> limit-string} ('Unlimited' or an integer entry-count cap).
+
+        Read-only table: Port N | Entry Limits. ('Unlimited' = port security off.)
+        """
+        html = self._get("/mac_constraint.cgi")
+        out = {}
+        for tbl in self._tables(html):
+            hdr = " ".join(tbl["header"]).lower()
+            if "port" in hdr and "entry limits" in hdr:
+                for r in tbl["rows"]:
+                    m = re.fullmatch(r"Port (\d+)", r[0]) if r else None
+                    if m and len(r) >= 2:
+                        out[int(m.group(1))] = r[1].strip()
+        return out
 
     # ===================================================================== #
     #  EEE
@@ -1758,8 +1937,15 @@ class CLI:
             print(f"{r['mac']:<18}  {r['vlan']:>4}  {r['type']:<9}  {iface}")
 
     def show_static_mac(self):
-        for ln in self.sw.fetch_static_mac():
-            print(ln)
+        rows = self.sw.fetch_static_mac()
+        if not rows:
+            print("No static MAC entries.")
+            return
+        print(f"{'No.':<4}  {'MAC Address':<18}  {'VLAN':>4}  Port")
+        for r in rows:
+            m = re.search(r"\d+", r["port"] or "")
+            iface = port_short(int(m.group())) if m else (r["port"] or "-")
+            print(f"{r['index']:<4}  {r['mac']:<18}  {r['vlan']:>4}  {iface}")
 
     def show_stp(self):
         d = self.sw.fetch_loop()
@@ -1788,26 +1974,85 @@ class CLI:
 
     def show_qos(self):
         d = self.sw.fetch_qos()
-        print("== Port priority =="); [print(" ", l) for l in d["port_pri"]]
-        print("== Scheduler ==");     [print(" ", l) for l in d["sched"]]
+        print("Port priority (egress queue):")
+        if d["port_pri"]:
+            print(f"  {'Interface':<11}{'Queue'}")
+            for p in sorted(d["port_pri"]):
+                print(f"  {port_short(p):<11}{d['port_pri'][p]}")
+        else:
+            print("  (no data)")
+        print()
+        print("Queue scheduler (WRR weight / strict priority):")
+        if d["sched"]:
+            print(f"  {'Queue':<7}{'Weight'}")
+            for q in d["sched"]:
+                print(f"  {q['queue']:<7}{q['weight']}")
+        else:
+            print("  (no data)")
 
     def show_storm(self):
-        [print(l) for l in self.sw.fetch_storm()]
+        rows = self.sw.fetch_storm()
+        if not rows:
+            print("No storm-control data.")
+            return
+        print(f"{'Interface':<11}{'Broadcast':<12}{'Known-Mcast':<13}"
+              f"{'Unkn-Ucast':<12}{'Unkn-Mcast'}")
+        for p in sorted(rows):
+            r = rows[p]
+            print(f"{port_short(p):<11}{r['broadcast']:<12}{r['known_mcast']:<13}"
+                  f"{r['unknown_ucast']:<12}{r['unknown_mcast']}")
 
     def show_igmp(self):
         d = self.sw.fetch_igmp()
         print(f"IGMP snooping: {'enabled' if d['enabled'] else 'disabled'}")
-        for l in d["lines"]:
-            print(" ", l)
+        if d["groups"]:
+            print()
+            print(f"{'Group / IP':<18}{'VLAN':>5}  Ports")
+            for g in d["groups"]:
+                print(f"{g['ip']:<18}{g['vlan']:>5}  {g['port']}")
+        else:
+            print("No multicast groups or router ports learned.")
 
     def show_trunk(self):
-        [print(l) for l in self.sw.fetch_trunk()]
+        groups = self.sw.fetch_trunk()
+        if not groups:
+            print("No aggregation groups.")
+            return
+        print(f"{'Group':<7}{'Type':<9}{'Members':<20}{'Aggregated'}")
+        for g in groups:
+            def ifaces(s):
+                ps = sorted(parse_portlist(re.sub(r"Port ?", "", s or "")))
+                return ",".join(port_short(p) for p in ps) if ps else "-"
+            print(f"{g['group']:<7}{g['type']:<9}{ifaces(g['members']):<20}"
+                  f"{ifaces(g['aggregated'])}")
 
     def show_mirror(self):
-        [print(l) for l in self.sw.fetch_mirror()]
+        m = self.sw.fetch_mirror()
+        if not m["enabled"]:
+            print("No mirror session configured.")
+            return
+        def ifaces(s):
+            ps = sorted(parse_portlist(re.sub(r"Port ?", "", s or "")))
+            return ",".join(port_short(p) for p in ps) if ps else (s or "-")
+        print("Mirror session 1")
+        print(f"  Direction   : {m['direction']}")
+        print(f"  Source      : {ifaces(m['sources'])}")
+        print(f"  Destination : {ifaces(m['dest'])}")
 
     def show_isolation(self):
-        [print(l) for l in self.sw.fetch_isolation()]
+        iso = self.sw.fetch_isolation()
+        if not iso:
+            print("No isolation data.")
+            return
+        nports = self.sw.nports
+        full = set(range(1, nports + 1))
+        print(f"{'Interface':<11}{'Forwards-To':<26}{'Isolated-From'}")
+        for p in sorted(iso):
+            allowed = parse_portlist(iso[p])
+            blocked = full - allowed
+            fwd = ",".join(port_short(x) for x in sorted(allowed)) or "none"
+            blk = ",".join(port_short(x) for x in sorted(blocked)) or "none"
+            print(f"{port_short(p):<11}{fwd:<26}{blk}")
 
     def show_jumbo(self):
         print(f"Jumbo frame size: {self.sw.fetch_jumbo()} bytes")
@@ -1816,10 +2061,25 @@ class CLI:
         print(f"EEE: {'enabled' if self.sw.fetch_eee() else 'disabled'}")
 
     def show_bw(self):
-        [print(l) for l in self.sw.fetch_bw()]
+        rows = self.sw.fetch_bw()
+        if not rows:
+            print("No rate-limit data.")
+            return
+        print(f"{'Interface':<11}{'Ingress (kbps)':<18}{'Egress (kbps)'}")
+        for p in sorted(rows):
+            r = rows[p]
+            print(f"{port_short(p):<11}{r['ingress']:<18}{r['egress']}")
 
     def show_mac_constraint(self):
-        [print(l) for l in self.sw.fetch_mac_constraint()]
+        rows = self.sw.fetch_mac_constraint()
+        if not rows:
+            print("No port-security data.")
+            return
+        print(f"{'Interface':<11}{'State':<10}{'MAC Limit'}")
+        for p in sorted(rows):
+            limit = rows[p]
+            state = "disabled" if limit.lower() in ("unlimited", "", "-") else "enabled"
+            print(f"{port_short(p):<11}{state:<10}{limit}")
 
     # ====================================================================== #
     #  NEW handlers — system
