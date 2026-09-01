@@ -69,7 +69,7 @@ work: `interface range tw1-4`, `interface te1,te2`.
 
 ```
 show vlan                         # VLAN table: name, untagged/tagged ports
-show interfaces                   # link, negotiated speed, admin, PVID, mode, membership
+show interfaces [status]          # link, negotiated speed, admin, PVID, mode, membership
 show running-config               # reconstructed IOS-style config
 show version                      # model / firmware / MAC / IP
 

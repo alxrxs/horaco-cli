@@ -1151,6 +1151,7 @@ HELP = {
     "interfaces": "Per-port status",
     "running-config": "Current running configuration",
     "version": "Model / firmware / addresses",
+    "status": "Per-port link status",
     "enable": "Enter privileged mode (already privileged)",
     "configure": "Enter global configuration mode",
     "terminal": "Configure from the terminal",
@@ -1260,6 +1261,8 @@ class CLI:
         return [
             # show — available in every mode
             (ALL, [_lit("show"), _lit("vlan")], lambda a: self.show_vlan(), "VLAN table"),
+            # IOS spells it "show interfaces status"; the bare form is the same table.
+            (ALL, [_lit("show"), _lit("interfaces"), _lit("status")], lambda a: self.show_interfaces(), "port status"),
             (ALL, [_lit("show"), _lit("interfaces")], lambda a: self.show_interfaces(), "port status"),
             (ALL, [_lit("show"), _lit("running-config")], lambda a: self.show_running(), "running config"),
             (ALL, [_lit("show"), _lit("version")], lambda a: self.show_version(), "system info"),
