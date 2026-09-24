@@ -21,11 +21,7 @@ Only dependency: `requests` (plus PyYAML). Python 3.8+.
 
 ## Setup
 
-Create an inventory file named `switches.yml` (plaintext) or `switches.sops.yaml`
-(SOPS-encrypted) — see [`switches.example.yml`](switches.example.yml). horaco.py looks
-for it, in order: `$HORACO_SWITCHES`, the current directory, then this script's
-directory and its parents (handy when the tool is a git submodule and the inventory
-lives in the parent repo).
+The inventory is a plaintext `switches.yml` when one exists — see [`switches.example.yml`](switches.example.yml) — looked for, in order, at `$HORACO_SWITCHES`, the current directory, then this script's directory and its parents (handy when the tool is a git submodule and the inventory lives in the parent repo). Without one, it is read from OpenBao at `secret/switches`, with the irix-infrastructure repo's `scripts/bao-token.sh` (found by walking up from this script).
 
 ```yaml
 switches:

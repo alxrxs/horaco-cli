@@ -31,8 +31,9 @@ separate per-port PVID form. This wrapper hides that and gives you an IOS-style 
 Auth model (reverse-engineered): the login form sets cookie `admin=md5(user+password)`
 and that cookie alone authorizes every subsequent .cgi request.
 
-Inventory + credentials come from a YAML file (switches.sops.yaml, decrypted on the fly
-via `sops`, or a plaintext switches.yml). See README.md.
+Inventory + credentials come from a plaintext switches.yml when one exists, else
+from OpenBao (secret/switches, read with the irix-infrastructure repo's
+scripts/bao-token.sh). See README.md.
 
 This file is dependency-light: only `requests` (already in the repo venv).
 """
@@ -58,7 +59,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # parent directory. So we search, in order: $HORACO_SWITCHES, the current
 # working directory, then this script's directory and its parents.
 # --------------------------------------------------------------------------- #
-INVENTORY_NAMES = ("switches.sops.yaml", "switches.yml", "switches.yaml")
+INVENTORY_NAMES = ("switches.yml", "switches.yaml")
 
 
 def _search_dirs():
@@ -100,25 +101,53 @@ def data_dir():
     return os.path.dirname(os.path.abspath(inv)) if inv else os.getcwd()
 
 
+def _find_bao_token_script(start_dir):
+    """Walk upward from start_dir for scripts/bao-token.sh (the irix-infrastructure repo root)."""
+    d = start_dir
+    for _ in range(6):
+        candidate = os.path.join(d, "scripts", "bao-token.sh")
+        if os.path.exists(candidate):
+            return candidate
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return None
+
+
+def load_from_bao(secret_name, start_dir):
+    """Read a KV-v2 secret from OpenBao (secret/<secret_name>), bao-token.sh-authenticated."""
+    token_script = _find_bao_token_script(start_dir)
+    if not token_script:
+        sys.exit(
+            f"No switches.yml and no scripts/bao-token.sh above {start_dir}: create "
+            "switches.yml (see switches.example.yml) or run from the irix-infrastructure "
+            "checkout, whose OpenBao secret/switches holds the inventory."
+        )
+    tok = subprocess.run([token_script], capture_output=True, text=True)
+    if tok.returncode != 0 or not tok.stdout.strip():
+        sys.exit(f"bao-token.sh failed:\n{tok.stderr}")
+    bao_addr = os.environ.get("BAO_ADDR", "https://bao.irix.systems")
+    resp = requests.get(
+        f"{bao_addr}/v1/secret/data/{secret_name}",
+        headers={"X-Vault-Token": tok.stdout.strip()},
+        timeout=8,
+    )
+    if resp.status_code != 200:
+        sys.exit(f"OpenBao read of secret/{secret_name} failed: {resp.status_code} {resp.text}")
+    return resp.json()["data"]["data"]
+
+
 def load_inventory():
-    """Return dict name -> {host,user,password,ports}. SOPS file or plaintext."""
+    """Return dict name -> {host,user,password,ports}. OpenBao-backed or plaintext file."""
     import yaml  # local import; only needed here
 
     path = find_inventory()
-    if not path:
-        sys.exit(
-            "No inventory found. Create switches.sops.yaml or switches.yml next to "
-            "the tool or in its parent dir, or set $HORACO_SWITCHES "
-            "(see switches.example.yml)."
-        )
-    if ".sops." in os.path.basename(path):
-        raw = subprocess.run(["sops", "--decrypt", path], capture_output=True, text=True)
-        if raw.returncode != 0:
-            sys.exit(f"sops decrypt failed for {path}:\n{raw.stderr}")
-        data = yaml.safe_load(raw.stdout)
-    else:
+    if path:
         with open(path) as fh:
             data = yaml.safe_load(fh)
+    else:
+        data = load_from_bao("switches", os.path.dirname(os.path.abspath(__file__)))
     return data.get("switches", data)
 
 
