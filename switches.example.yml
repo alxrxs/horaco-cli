@@ -1,8 +1,7 @@
-# horaco-cli inventory — copy this to one of:
-#   switches.yml            (plaintext; keep it out of git)
-#   switches.sops.yaml      (SOPS-encrypted; safe to commit)
-# placed NEXT TO this tool, in its PARENT directory, or pointed to by
-# the $HORACO_SWITCHES environment variable.
+# horaco-cli inventory -- copy this to switches.yml (plaintext; keep it out of
+# git), placed NEXT TO this tool, in its PARENT directory, or pointed to by the
+# $HORACO_SWITCHES environment variable. Without one the inventory is read from
+# OpenBao (see README.md).
 #
 # Auth: the ZX-SWTG124AS web UI uses cookie admin=md5(user+password);
 # horaco.py computes that for you, so just give the real username/password.
